@@ -629,6 +629,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
+name = "versus-backend"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+ "windows-sys",
+]
+
+[[package]]
 name = "victory"
 version = "0.1.0"
 dependencies = [
@@ -636,6 +644,7 @@ dependencies = [
  "blake3",
  "clap",
  "memchr",
+ "versus-backend",
  "victory-core",
  "victory-game",
  "victory-hle",
@@ -677,6 +686,7 @@ dependencies = [
  "blake3",
  "tempfile",
  "tracing",
+ "versus-backend",
  "victory-formats",
  "victory-pipeline",
  "victory-shader",
@@ -739,6 +749,7 @@ dependencies = [
 name = "victory-shader"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "thiserror",
  "windows",
  "windows-sys",
