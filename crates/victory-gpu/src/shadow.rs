@@ -905,66 +905,68 @@ mod card_tests {
         }
     }
 
-    /// The slots are a power of two, one per 64 KiB asked, within the
-    /// shader's 32-bit offsets.
+    /// The slots are one per 64 KiB asked, within the shader's 32-bit
+    /// offsets.
     #[test]
-    fn inflight_slots_are_a_power_of_two() {
+    fn inflight_slots_are_one_per_64_kib() {
         use crate::host::{INFLIGHT_SLOT, inflight_slots};
         assert_eq!(inflight_slots(64 << 20), 1024);
-        assert_eq!(inflight_slots(100 << 20), 1024);
+        assert_eq!(inflight_slots(100 << 20), 1600);
         assert_eq!(inflight_slots(1), 1);
         assert_eq!(inflight_slots(1 << 20), 16);
         let most = inflight_slots(u64::MAX);
-        assert!(most.is_power_of_two() && u64::from(most) * INFLIGHT_SLOT <= 1 << 32);
+        assert!(u64::from(most) * INFLIGHT_SLOT <= 1 << 32);
     }
 
-    /// Tickets drawn and landed in order, the mark raised as the landing
-    /// raises it (every ticket a landed flight drew), through the counter's
-    /// wrap with the slots the default gives: no two tickets in the air
-    /// that got a slot share one, slots are still given after the wrap, and
-    /// the mark follows the counter.
+    /// Flights take regions of the staging buffer in order and give them
+    /// back in order, of all sizes, round the buffer's end many times: two
+    /// regions in the air never share a slot, a region never runs past the
+    /// end, and a flight finds no room only when the regions in the air
+    /// leave none where it would go.
     #[test]
-    fn inflight_tickets_never_share_a_slot_across_the_wrap() {
-        use crate::host::{inflight_gets_slot, inflight_raise, inflight_slots};
-        let slots = inflight_slots(64 << 20);
-        let mut landed = u32::MAX - 3000;
-        let mut next = landed;
-        // Flights of 1 to 700 flagged pieces, up to three in the air:
-        // (tickets drawn, those that got a slot).
-        let mut air: std::collections::VecDeque<(Vec<u32>, Vec<u32>)> = Default::default();
-        let mut after_wrap = 0;
-        for flight in 0..40u32 {
-            let drawn: Vec<u32> = (0..1 + flight * 37 % 700).map(|i| next.wrapping_add(i)).collect();
-            next = next.wrapping_add(drawn.len() as u32);
-            let slotted: Vec<u32> = drawn.iter().copied().filter(|&k| inflight_gets_slot(k, landed, slots)).collect();
-            after_wrap += slotted.iter().filter(|&&k| k < 1 << 20).count();
-            air.push_back((drawn, slotted));
-            let mut used: Vec<u32> = air.iter().flat_map(|a| a.1.iter()).map(|k| k % slots).collect();
-            let n = used.len();
-            used.sort_unstable();
-            used.dedup();
-            assert_eq!(used.len(), n, "flight {flight}: two tickets in the air share a slot");
-            if air.len() == 3
-                && let Some((drawn, _)) = air.pop_front()
-            {
-                for k in drawn {
-                    landed = inflight_raise(landed, k);
+    fn regions_in_the_air_never_share_a_slot() {
+        use crate::host::take_region;
+        let slots = 1024u32;
+        let mut air: std::collections::VecDeque<(u32, u32)> = Default::default();
+        let (mut head, mut taken, mut refused) = (0u32, 0, 0);
+        for flight in 0..2000u32 {
+            let want = 1 + flight * 97 % 400;
+            match take_region(&air, head, slots, want) {
+                Some(base) => {
+                    assert!(base + want <= slots, "flight {flight} runs past the end");
+                    for &(b, l) in &air {
+                        assert!(base + want <= b || b + l <= base, "flight {flight} shares a slot");
+                    }
+                    air.push_back((base, want));
+                    head = base + want;
+                    taken += 1;
+                }
+                None => {
+                    // Room only behind the oldest: it lands (and the flight
+                    // goes the old way).
+                    assert!(!air.is_empty(), "flight {flight} refused with nothing in the air");
+                    air.pop_front();
+                    refused += 1;
                 }
             }
-        }
-        while let Some((drawn, _)) = air.pop_front() {
-            for k in drawn {
-                landed = inflight_raise(landed, k);
+            // Up to four flights in the air.
+            if air.len() > 3 {
+                air.pop_front();
             }
         }
-        assert!(next < 1 << 20, "the counter wrapped");
-        assert!(after_wrap > 0, "slots after the wrap");
-        assert_eq!(landed, next);
-        // Raised in wrapping order, never back.
-        assert_eq!(inflight_raise(u32::MAX - 1, u32::MAX), 0);
-        assert_eq!(inflight_raise(5, 2), 5);
-        assert_eq!(inflight_raise(u32::MAX - 1, 3), 4);
-        assert!(!inflight_gets_slot(3, 4, 8));
+        assert!(taken > 0, "{taken} taken, {refused} refused");
+        // Nothing in the air: any size that fits, at the head or at 0.
+        let none = std::collections::VecDeque::new();
+        assert_eq!(take_region(&none, 1000, slots, 24), Some(1000));
+        assert_eq!(take_region(&none, 1000, slots, 25), Some(0));
+        assert_eq!(take_region(&none, 0, slots, 1025), None);
+        assert_eq!(take_region(&none, 0, slots, 0), None);
+        // Behind the oldest region only as far as its start.
+        let one: std::collections::VecDeque<(u32, u32)> = [(100u32, 50u32)].into();
+        assert_eq!(take_region(&one, 150, slots, 874), Some(150));
+        assert_eq!(take_region(&one, 150, slots, 875), None);
+        assert_eq!(take_region(&one, 1000, slots, 100), Some(0));
+        assert_eq!(take_region(&one, 1000, slots, 101), None);
     }
 
     /// Flights 5, 6, 7 in the air with the fetch inside flights: 5 lands
