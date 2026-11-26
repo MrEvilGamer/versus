@@ -257,6 +257,8 @@ pub(crate) struct Tiled {
     packed: u32,
     /// Levels in all.
     levels: u32,
+    /// Lowest mip level allowed by `VICTORY_MAX_TEXTURE_DIM` (0 = unclamped).
+    min_level: u32,
     /// The bytes all its tiles would take.
     pub(crate) full: u64,
     given: Mutex<Given>,
@@ -319,6 +321,16 @@ impl Tiled {
         if (packed.NumPackedMips > 0 && packed_tiles == 0) || packed_tiles > HEAP_TILES {
             return None;
         }
+        let desc = unsafe { texture.GetDesc() };
+        let mut min_level = 0u32;
+        if let Some(max_dim) = max_texture_dim() {
+            while min_level + 1 < levels
+                && ((desc.Width >> min_level) > u64::from(max_dim)
+                    || (desc.Height >> min_level) > max_dim)
+            {
+                min_level += 1;
+            }
+        }
         let full = u64::from(total) * TILE;
         STATS[0].fetch_add(1, Ordering::Relaxed);
         STATS[1].fetch_add(full, Ordering::Relaxed);
@@ -332,6 +344,7 @@ impl Tiled {
             standard,
             packed: packed_tiles,
             levels,
+            min_level,
             full,
             shown: AtomicU32::new(u32::MAX),
             held: AtomicU32::new(0),
@@ -372,6 +385,12 @@ impl Tiled {
         room: bool,
     ) -> (bool, bool) {
         let held = held & self.every_level();
+        let clamped = if self.min_level > 0 && self.min_level < 32 {
+            held & !((1u32 << self.min_level) - 1)
+        } else {
+            held
+        };
+        let held = if clamped != 0 { clamped } else { held };
         let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
         self.held.store(held, Ordering::Relaxed);
         let card = self.card.load(Ordering::Relaxed);
@@ -680,6 +699,52 @@ pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, 
         }
         _ => {}
     }
+}
+
+/// Optional cap on the finest mip dimension given tiles (`VICTORY_MAX_TEXTURE_DIM=512` or `1024`).
+fn max_texture_dim() -> Option<u32> {
+    static DIM: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *DIM.get_or_init(|| {
+        let dim = std::env::var("VICTORY_MAX_TEXTURE_DIM")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&d| d >= 64);
+        if let Some(d) = dim {
+            tracing::info!(
+                "clamping tiled texture uploads to at most {d}px per side (VICTORY_MAX_TEXTURE_DIM={d})"
+            );
+        }
+        dim
+    })
+}
+
+/// First mip level allowed for a texture of `width` x `height` with `levels` mips.
+pub(crate) fn min_allowed_level(width: u64, height: u32, levels: u32) -> u32 {
+    let Some(max_dim) = max_texture_dim() else {
+        return 0;
+    };
+    let mut min_level = 0u32;
+    while min_level + 1 < levels
+        && ((width >> min_level) > u64::from(max_dim) || (height >> min_level) > max_dim)
+    {
+        min_level += 1;
+    }
+    min_level
+}
+
+/// Whether `VICTORY_MAX_TEXTURE_DIM` wants to clamp top mips of this texture.
+pub(crate) fn exceeds_max_dim(width: u64, height: u32, levels: u16) -> bool {
+    min_allowed_level(width, height, u32::from(levels)) > 0
+}
+
+/// Clears mip bits finer than `min_allowed_level` if any coarser level is held.
+pub(crate) fn clamp_held_mask(held: u32, width: u32, height: u32, levels: u32) -> u32 {
+    let min_level = min_allowed_level(u64::from(width), height, levels);
+    if min_level == 0 || min_level >= 32 {
+        return held;
+    }
+    let clamped = held & !((1u32 << min_level) - 1);
+    if clamped != 0 { clamped } else { held }
 }
 
 /// For the log, with the texture queue's line: what this saves, and what

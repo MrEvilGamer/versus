@@ -1716,6 +1716,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             && r.desc.depth_or_array_size == 1
             && r.desc.mip_levels > 1
             && r.desc.sample_count <= 1;
+        let clamped = crate::tiles::exceeds_max_dim(r.desc.width, r.desc.height, r.desc.mip_levels);
         if shape_fits && r.host.placed.load(Relaxed) && crate::tiles::wanted() {
             let bytes = footprint(&r.desc).map_or(0, |f| f.size);
             let start = r.data() as u64;
@@ -1723,10 +1724,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             // (`crate::texture` `staging`).
             let readable = texture_layout(&r.desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor());
             let partly = readable
-                && bytes >= crate::tiles::floor()
-                && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
-                    || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
-                    || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
+                && (clamped
+                    || (bytes >= crate::tiles::floor()
+                        && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
+                            || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
+                            || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0))));
             let reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true) } else { None };
             let cut = reserved
                 .as_ref()
