@@ -72,6 +72,7 @@ const SHARED_DEFAULTS: &[(&str, &str)] = &[
     ("VICTORY_METER_THREAD", "1"),
     ("VICTORY_WAIT_RESIDENT", "0"),
     ("VICTORY_GGVL_SKIP_READONLY_HASH", "1"),
+    ("VICTORY_CARD_STEPS", "2"),
     // Neutral graphics quality defaults (independently overridable via env vars).
     ("VICTORY_DISPLAY_MODE", "960x540"),
     ("VICTORY_MAX_TEXTURE_DIM", "512"),
