@@ -4241,7 +4241,7 @@ impl Host {
     /// `relay`).
     /// `picked`: ranges that may be written too, and ranges to look at
     /// (`crate::picked`).
-    fn card_before(&self, declared: &[Declared], picked: &crate::picked::Ranges, flown: bool) -> Option<CardPlan> {
+    fn card_before(&self, declared: &[Declared], picked: &crate::picked::Ranges, flown: bool, submission: u64) -> Option<CardPlan> {
         use std::sync::Arc;
         if !crate::shadow::cards() {
             return None;
@@ -4449,7 +4449,8 @@ impl Host {
                 crate::ggvl_bridge::note_gpu_uav_write(
                     (shadow.start as u64).saturating_add(from as u64),
                     to.saturating_sub(from) as u64,
-                    crate::frame::current(),
+                    // GGVL completion uses FINISHED submission serials, not display frames.
+                    submission,
                 );
                 let Some(span) = shadow.card_span(from, to) else {
                     continue;
@@ -5690,7 +5691,7 @@ impl Host {
             shadow.writing(*at, *len);
         }
         let declared = declared_writes(runs);
-        let card = self.card_before(&declared, &picked, flown);
+        let card = self.card_before(&declared, &picked, flown, this_submission);
         // The sends are taken: from here on the references hold what the
         // copies in the lists put.
         for (shadow, at, bytes) in batch.placed.drain(..) {
