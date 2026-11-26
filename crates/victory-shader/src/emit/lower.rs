@@ -6747,6 +6747,7 @@ impl<'a> Lower<'a> {
                     0 => 1,
                     1 => 2,
                     2 => 4,
+                    3 => 5,
                     4 => 6,
                     5 => 7,
                     _ => return Err("an image dimension (cube or MSAA)"),
