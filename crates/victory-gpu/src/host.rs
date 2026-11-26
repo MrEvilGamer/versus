@@ -4423,6 +4423,16 @@ impl Host {
                         let (Some((_, Some(before), _)), size) = (shadow.card_sides(), shadow.card_hash_size()) else {
                             continue;
                         };
+                        let base_addr = shadow.start as u64;
+                        for &(a, b) in ranges {
+                            crate::ggvl_bridge::note_cpu_upload(base_addr.saturating_add(a as u64), b.saturating_sub(a) as u64);
+                        }
+                        if !whole.iter().any(|s| Arc::ptr_eq(s, shadow))
+                            && !declared.iter().any(|(s, _)| Arc::ptr_eq(s, shadow))
+                            && crate::ggvl_bridge::may_skip_rehash(base_addr, shadow.len as u64)
+                        {
+                            continue;
+                        }
                         // No twin (it cost the card the copy's size again,
                         // 399 MB in run 75): `before` holds a 128-bit hash
                         // of each 64 KiB piece. The pieces just sent up are
@@ -4490,6 +4500,11 @@ impl Host {
             }
             let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
             for (from, to) in spans {
+                crate::ggvl_bridge::note_gpu_uav_write(
+                    (shadow.start as u64).saturating_add(from as u64),
+                    to.saturating_sub(from) as u64,
+                    crate::frame::current(),
+                );
                 let Some(span) = shadow.card_span(from, to) else {
                     continue;
                 };

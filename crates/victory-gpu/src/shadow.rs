@@ -38,8 +38,8 @@ pub(crate) struct Shadow {
     data: *mut u8,
     gpu: u64,
     /// Where the title buffer starts and how long it is.
-    start: u64,
-    len: u64,
+    pub(crate) start: u64,
+    pub(crate) len: u64,
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
     copied: Mutex<Vec<u64>>,
