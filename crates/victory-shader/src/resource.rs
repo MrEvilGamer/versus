@@ -1128,7 +1128,7 @@ impl<'a> Tracer<'a> {
             .ok_or("a descriptor not in SGPRs")?;
         // A byte access through a buffer descriptor made raw reads what the
         // descriptor's view does with a raw host view (VIctory upstream 0b35b7f).
-        if !inst.name().contains("format")
+        if (!inst.name().contains("format") || inst.name().starts_with("tbuffer_"))
             && let Some(raw) = self.made_raw(&words)
         {
             words = raw.to_vec();
