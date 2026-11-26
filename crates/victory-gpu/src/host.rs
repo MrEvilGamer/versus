@@ -9323,11 +9323,17 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let present_hr = p.swap_chain.Present(0, DXGI_PRESENT(0));
             showing.next("the frame meter");
-            #[cfg(feature = "diagnostics")]
-            p.panel.frame(p.meter.line_due());
-            p.meter.frame(p.hwnd);
+            if present_hr.0 == 0 {
+                #[cfg(feature = "diagnostics")]
+                p.panel.frame(p.meter.line_due());
+                p.meter.frame(p.hwnd);
+            } else if present_hr.0 == 0x087A_0001 {
+                tracing::debug!("swapchain Present occluded (not counted as accepted frame)");
+            } else {
+                tracing::warn!(hr = format!("0x{:08x}", present_hr.0 as u32), "swapchain Present failed (not counted as accepted frame)");
+            }
             showing.end();
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
