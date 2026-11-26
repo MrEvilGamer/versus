@@ -7591,6 +7591,9 @@ struct Batch {
     /// `ahead` holds everything the submission refreshes
     /// ([`Batch::refresh_front`]).
     front: bool,
+    /// Submission-local cache of verified clean `[from, to)` ranges per shadow copy
+    /// (invalidated whenever any refresh actually updates or copies memory).
+    clean_cache: ByCopy<Vec<(usize, usize)>>,
 }
 
 /// Whether the copies that a submission's shaders write are brought up to
@@ -8088,6 +8091,21 @@ impl Batch {
         }
     }
 
+    fn is_cached_clean(&self, shadow: &crate::shadow::Shadow, from: usize, to: usize) -> bool {
+        let key = std::ptr::from_ref(shadow) as usize;
+        self.clean_cache
+            .get(&key)
+            .is_some_and(|ranges| ranges.iter().any(|&(a, b)| a <= from && to <= b))
+    }
+
+    fn record_clean(&mut self, shadow: &crate::shadow::Shadow, from: usize, to: usize) {
+        let key = std::ptr::from_ref(shadow) as usize;
+        let entry = self.clean_cache.entry(key).or_default();
+        if !entry.iter().any(|&(a, b)| a <= from && to <= b) {
+            entry.push((from, to));
+        }
+    }
+
     fn flush_all(&mut self) {
         // Most of a flush's copies are as they were: they are told so here,
         // from what the submission's asking found, before anything is asked
@@ -8095,14 +8113,49 @@ impl Batch {
         // once a frame: on the threads, below.)
         const FEW: usize = 256;
         let light = crate::watch::light();
+        if light && !self.clean_cache.is_empty() {
+            #[cfg(feature = "diagnostics")]
+            let before = self.refreshes.len();
+            self.refreshes.retain(|(shadow, from, to)| {
+                !self.clean_cache
+                    .get(&(std::ptr::from_ref(shadow.as_ref()) as usize))
+                    .is_some_and(|ranges| ranges.iter().any(|&(a, b)| a <= *from && *to <= b))
+            });
+            #[cfg(feature = "diagnostics")]
+            FLUSHES[2].fetch_add((before - self.refreshes.len()) as u64, Ordering::Relaxed);
+            if self.refreshes.is_empty() {
+                return;
+            }
+        }
         if light && self.refreshes.len() <= FEW {
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             let all = self.refreshes.len();
-            self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            let mut newly_clean: Vec<(usize, usize, usize)> = Vec::new();
+            self.refreshes.retain(|(shadow, from, to)| {
+                if shadow.nothing_new(*from, *to - *from) {
+                    newly_clean.push((std::ptr::from_ref(shadow.as_ref()) as usize, *from, *to));
+                    false
+                } else {
+                    true
+                }
+            });
+            for (key, from, to) in newly_clean {
+                let entry = self.clean_cache.entry(key).or_default();
+                if !entry.iter().any(|&(a, b)| a <= from && to <= b) {
+                    entry.push((from, to));
+                }
+            }
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
+            if self.refreshes.is_empty() {
+                return;
+            }
+        }
+        // Any remaining refresh may write or copy-back; invalidate clean cache conservatively.
+        if !self.refreshes.is_empty() {
+            self.clean_cache.clear();
         }
         // One write-watch asking for the copies that lie close together,
         // not one per copy.

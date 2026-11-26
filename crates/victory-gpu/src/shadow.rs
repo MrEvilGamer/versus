@@ -1257,19 +1257,71 @@ static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 /// of about that size: a small copy's snapshot took the 174 MB buffer kept
 /// for the big heap's, which then got another, until eight of them were
 /// reserved (1.4 GB in run 24).
+struct SnapPool {
+    buckets: std::collections::BTreeMap<usize, Vec<Vec<u8>>>,
+    count: usize,
+    total_bytes: usize,
+}
+
+impl SnapPool {
+    const fn new() -> Self {
+        Self {
+            buckets: std::collections::BTreeMap::new(),
+            count: 0,
+            total_bytes: 0,
+        }
+    }
+
+    fn take(&mut self, n: usize) -> Option<Vec<u8>> {
+        let most = n.saturating_mul(4).max(1 << 20);
+        let key = *self.buckets.range(n..=most).next()?.0;
+        let bucket = self.buckets.get_mut(&key)?;
+        let v = bucket.pop()?;
+        if bucket.is_empty() {
+            self.buckets.remove(&key);
+        }
+        self.count = self.count.saturating_sub(1);
+        self.total_bytes = self.total_bytes.saturating_sub(v.capacity());
+        Some(v)
+    }
+
+    fn give(&mut self, v: Vec<u8>, max_kept: usize, max_bytes: usize) -> Vec<Vec<u8>> {
+        let cap = v.capacity();
+        if cap == 0 {
+            return Vec::new();
+        }
+        self.buckets.entry(cap).or_default().push(v);
+        self.count += 1;
+        self.total_bytes = self.total_bytes.saturating_add(cap);
+        let mut gone = Vec::new();
+        // Evict smallest buckets first when over count or byte budget (always keep at least 1).
+        while self.count > 1 && (self.count > max_kept || self.total_bytes > max_bytes) {
+            let Some(&smallest_key) = self.buckets.keys().next() else {
+                break;
+            };
+            if let Some(bucket) = self.buckets.get_mut(&smallest_key) {
+                if let Some(evicted) = bucket.pop() {
+                    self.count -= 1;
+                    self.total_bytes = self.total_bytes.saturating_sub(evicted.capacity());
+                    gone.push(evicted);
+                }
+                if bucket.is_empty() {
+                    self.buckets.remove(&smallest_key);
+                }
+            }
+        }
+        gone
+    }
+}
+
+static SNAP_POOL: Mutex<SnapPool> = Mutex::new(SnapPool::new());
+
 fn pooled(n: usize) -> Vec<u8> {
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let most = n.saturating_mul(4).max(1 << 20);
-    let fit = pool
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| v.capacity() >= n && v.capacity() <= most)
-        .min_by_key(|(_, v)| v.capacity())
-        .map(|(i, _)| i);
-    let mut v = match fit {
-        Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
-    };
+    let mut v = SNAP_POOL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take(n)
+        .unwrap_or_else(|| Vec::with_capacity(n));
     v.clear();
     v
 }
@@ -1293,20 +1345,11 @@ fn snapshots_kept() -> usize {
 /// bytes in all.
 fn give_back(v: Vec<u8>) {
     const KEPT: usize = 512 << 20;
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    pool.push(v);
-    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    let (mut kept, mut total) = (0, 0usize);
-    for v in pool.iter().take(snapshots_kept()) {
-        total = total.saturating_add(v.capacity());
-        if kept > 0 && total > KEPT {
-            break;
-        }
-        kept += 1;
-    }
-    // (Given back to the kernel without the lock: milliseconds.)
-    let gone = pool.split_off(kept);
-    drop(pool);
+    let gone = SNAP_POOL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .give(v, snapshots_kept(), KEPT);
+    // Drop evicted buffers outside the lock.
     drop(gone);
 }
 
@@ -1613,7 +1656,36 @@ pub(crate) fn take_snapshots() {
     if snaps.is_empty() {
         return;
     }
-    wide(copy_jobs(snaps));
+    let total_bytes: usize = snaps.iter().map(|&(_, _, len)| len).sum();
+    if total_bytes == 0 {
+        return;
+    }
+    let threads = wide_threads() + 1;
+    // Adaptive chunk size: target ~4 chunks per worker thread, clamped to [64 KiB, 1 MiB].
+    let chunk_size = (total_bytes / (threads * 4)).clamp(64 << 10, WIDE_JOB);
+    let mut flat: Vec<(usize, usize, usize)> = Vec::with_capacity(snaps.len() + total_bytes / chunk_size);
+    for (src, dst, len) in snaps {
+        let mut at = 0;
+        while at < len {
+            let n = chunk_size.min(len - at);
+            flat.push((src + at, dst + at, n));
+            at += n;
+        }
+    }
+    let count = flat.len();
+    if count <= 1 || total_bytes < (64 << 10) {
+        for (src, dst, len) in flat {
+            // SAFETY: caller's non-overlapping host copy mapping and snapshot buffer.
+            unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+        }
+        return;
+    }
+    let flat = Arc::new(flat);
+    wide_each(count, move |i| {
+        let (src, dst, len) = flat[i];
+        // SAFETY: caller's non-overlapping host copy mapping and snapshot buffer.
+        unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+    });
 }
 
 /// `copies` (from, to, bytes) as pieces of work of about [`WIDE_JOB`]
