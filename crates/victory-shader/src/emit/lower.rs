@@ -1003,7 +1003,15 @@ fn lane_constant_masks(st: &Structured) -> bool {
         LaneExit::Branch { when, .. } => Some(when),
         _ => None,
     });
-    let mut work: Vec<Bool> = st.guards.iter().flatten().flatten().copied().chain(whens).collect();
+    let mut work: Vec<Bool> = st
+        .guards
+        .iter()
+        .flatten()
+        .flatten()
+        .copied()
+        .chain(whens)
+        .chain(st.masks.values().copied())
+        .collect();
     // Through lane-mask joins too: an edge that brings a number or a constant lane set needs
     // the lane's own bit of it.
     // shortcut: masks only selects read (`v_cndmask_b32`, carries in) are not followed; such
