@@ -4160,13 +4160,15 @@ impl<'a> Lower<'a> {
             Atom::Opaque(v) if self.console_lanes => {
                 // A stale descriptor register reaching a lane-mask join on a
                 // dead path is never a live mask; treat its bit as false.
-                if self.dead(v, &mut Vec::new()) {
+                let hi_val = self.pair_high(v);
+                if self.dead(v, &mut Vec::new())
+                    || hi_val.is_some_and(|h| self.dead(h, &mut Vec::new()))
+                {
                     return Ok(self.s.m.bool(false));
                 }
                 // An opaque mask value from a block that does not dominate `at`
                 // (e.g. propagated through a join across a non-dominating edge)
                 // cannot be read here without creating an invalid forward ref.
-                let hi_val = self.pair_high(v);
                 if self
                     .def_block
                     .get(&v)
