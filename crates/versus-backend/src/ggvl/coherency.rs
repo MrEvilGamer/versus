@@ -135,7 +135,29 @@ impl ResourceCoherencyManager {
     ) -> Result<(), GgvlError> {
         let res = self.resources.get(&id).ok_or(GgvlError::UnknownResource(id))?;
         let _ = res.page_range(addr, len)?;
-        let write_end = addr + len;
+        self.record_gpu_write(Some(id), addr, len, deps)
+    }
+
+    /// Records an observed write to raw guest buffer memory once, without
+    /// requiring a unique source ID. Derived texture aliases need conversion.
+    /// The caller must supply dependencies in actual queue-fence units.
+    pub fn on_gpu_buffer_write(
+        &mut self,
+        addr: u64,
+        len: u64,
+        deps: QueueDeps,
+    ) -> Result<(), GgvlError> {
+        self.record_gpu_write(None, addr, len, deps)
+    }
+
+    fn record_gpu_write(
+        &mut self,
+        source: Option<u64>,
+        addr: u64,
+        len: u64,
+        deps: QueueDeps,
+    ) -> Result<(), GgvlError> {
+        let write_end = addr.checked_add(len).ok_or(GgvlError::AddressOverflow)?;
         let aliases = self.page_table.overlapping(addr, len)?;
         for other_id in aliases {
             if let Some(other) = self.resources.get_mut(&other_id) {
@@ -151,7 +173,7 @@ impl ResourceCoherencyManager {
                 for pg in &mut other.pages[first..=last] {
                     pg.gpu_gen += 1;
                     pg.last_gpu_deps.merge(deps);
-                    pg.state = if other_id == id {
+                    pg.state = if source == Some(other_id) {
                         PageState::GpuAuthoritative
                     } else if other.is_derived_texture {
                         PageState::DerivedConversionPending { deps }
