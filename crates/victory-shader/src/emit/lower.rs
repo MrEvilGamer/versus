@@ -10939,7 +10939,7 @@ impl<'a> Lower<'a> {
             // float format (the console converts by the view's format).
             // One channel goes into a view the program also counts in.
             let counter = *dmask == 1 && self.is_counter(src);
-            if *dmask != 0xF && !counter {
+            if !matches!(*dmask, 0x1 | 0x3 | 0x7 | 0xF) {
                 return Err("an image store of some channels");
             }
             let iu = self.s.m.undef(self.s.t.i32);
@@ -10979,13 +10979,18 @@ impl<'a> Lower<'a> {
                 return Ok(());
             }
             let mut vals = Vec::new();
+            let mut packed = 0u8;
             for k in 0..4u8 {
+                if (*dmask & (1 << k)) == 0 {
+                    vals.push(self.s.m.f32(0));
+                    continue;
+                }
                 // d16: two f16 channels per VGPR, low half first.
-                let r = if *d16 { k / 2 } else { k };
+                let r = if *d16 { packed / 2 } else { packed };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
                 vals.push(if *d16 {
                     let mut x = self.i32_of(v)?;
-                    if k % 2 == 1 {
+                    if packed % 2 == 1 {
                         let k16 = self.s.m.i32(16);
                         x = self.s.m.bin(self.cur, Bin::LShr, x, k16);
                     }
@@ -10995,6 +11000,7 @@ impl<'a> Lower<'a> {
                 } else {
                     self.float_of(v)?
                 });
+                packed += 1;
             }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);

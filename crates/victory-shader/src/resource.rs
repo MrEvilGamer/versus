@@ -615,7 +615,7 @@ impl<'a> Tracer<'a> {
         let i = scalar.binary_search_by_key(&load, |(site, _)| *site).ok()?;
         let address = scalar[i].1;
         let base = self.layout.get(address.param)?;
-        if base.root != RootType::Table {
+        if base.root != RootType::Table || address.dynamic2.is_some() {
             return None;
         }
         let dynamic = address.dynamic?;
@@ -1546,7 +1546,11 @@ impl<'a> Tracer<'a> {
         self.read_first_lane.set(true);
         let address = self.smem_address(inst, base, *offset, soffset);
         self.read_first_lane.set(false);
-        match self.origin(address.ok()?.dynamic?) {
+        let addr = address.ok()?;
+        if addr.dynamic2.is_some() {
+            return None;
+        }
+        match self.origin(addr.dynamic?) {
             Term::Value(v) if self.first_lane_source(v).is_some() => Some(v),
             _ => None,
         }
@@ -1756,7 +1760,7 @@ impl<'a> Tracer<'a> {
             self.runs(site, known)?;
             let a = address(site)?;
             let want = a0.offset.wrapping_add(4 * (first + k) as u32);
-            if (a.param, a.dynamic) != (a0.param, a0.dynamic)
+            if (a.param, a.dynamic, a.dynamic2) != (a0.param, a0.dynamic, a0.dynamic2)
                 || a.offset.wrapping_add(4 * dword as u32) != want
             {
                 return Err("a descriptor read from the first lane of loads that do not line up");
