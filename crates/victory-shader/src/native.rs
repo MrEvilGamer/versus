@@ -562,20 +562,15 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
     if next_ud < user_sgprs
         && !layout.iter().any(|p| p.root == RootType::ResourceHeap)
     {
-        let (res_ud, smp_ud) = if user_sgprs >= next_ud + 2 {
-            (user_sgprs - 2, Some(user_sgprs - 1))
-        } else {
-            (next_ud, None)
-        };
         layout.push(RootParam {
             root: RootType::ResourceHeap,
             table_offset_dwords: 0,
             sgprs: 1,
             base_register: 0,
-            user_data: res_ud as u8,
+            user_data: next_ud as u8,
             slot: 0xFE,
         });
-        if let Some(smp_ud) = smp_ud
+        if next_ud + 1 < user_sgprs
             && !layout.iter().any(|p| p.root == RootType::SamplerHeap)
         {
             layout.push(RootParam {
@@ -583,7 +578,7 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
                 table_offset_dwords: 0,
                 sgprs: 1,
                 base_register: 0,
-                user_data: smp_ud as u8,
+                user_data: (next_ud + 1) as u8,
                 slot: 0xFF,
             });
         }
