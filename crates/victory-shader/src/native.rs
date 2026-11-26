@@ -540,7 +540,7 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
             RootType::ImmediateSampler => 0,
             _ => return Err(Malformed("an FSPX resource of an unknown root type")),
         };
-        if sgprs > 0 && !layout.iter().any(|p| p.slot == u.slot) {
+        if sgprs > 0 && !layout.iter().any(|p| p.user_data == u.user_data && p.root == root) {
             layout.push(RootParam {
                 root,
                 table_offset_dwords: 0,
@@ -552,6 +552,37 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
         }
         used.push(u);
     }
+    let rsrc2 = u32_at(packet, PACKET_RSRC2)?;
+    let user_sgprs = (rsrc2 >> 1) & 0x1F;
+    let next_ud = layout
+        .iter()
+        .map(|p| u32::from(p.user_data) + p.sgprs)
+        .max()
+        .unwrap_or(0);
+    if next_ud < user_sgprs
+        && !layout.iter().any(|p| p.root == RootType::ResourceHeap)
+    {
+        layout.push(RootParam {
+            root: RootType::ResourceHeap,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: next_ud as u8,
+            slot: 0xFE,
+        });
+        if next_ud + 1 < user_sgprs
+            && !layout.iter().any(|p| p.root == RootType::SamplerHeap)
+        {
+            layout.push(RootParam {
+                root: RootType::SamplerHeap,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: (next_ud + 1) as u8,
+                slot: 0xFF,
+            });
+        }
+    }
     Ok(NativeProgram {
         stage: HwStage::Cs,
         wave64,
@@ -559,7 +590,7 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
         layout,
         used,
         io: StageIo::Cs(ComputeIo {
-            rsrc2: u32_at(packet, PACKET_RSRC2)?,
+            rsrc2,
             threads: [threads(0)?, threads(1)?, threads(2)?],
         }),
         code: code.to_vec(),
