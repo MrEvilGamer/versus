@@ -439,13 +439,16 @@ fn sweep() {
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = now_ms();
     let last = LAST.load(Ordering::Relaxed);
-    if now < last + 1000
+    // Milestone 4: tighten VRAM reclamation cadence (1000 ms -> 250 ms) under GGVL VRAM pressure.
+    let interval = if crate::ggvl_bridge::vram_under_pressure() { 250 } else { 1000 };
+    if now < last + interval
         || LAST
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
     {
         return;
     }
+    crate::ggvl_bridge::on_graphics_fence_complete(FINISHED.load(Ordering::Acquire));
     #[cfg(feature = "diagnostics")]
     crate::book::check();
     crate::pool::room(host().and_then(|h| h.video_memory()));

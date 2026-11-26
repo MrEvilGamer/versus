@@ -94,6 +94,22 @@ pub(crate) fn on_buffer_unregister(resource: usize, start: u64) {
     }
 }
 
+/// Returns true when live DXGI VRAM usage exceeds `ResidencyManager`'s high watermark (92%).
+pub(crate) fn vram_under_pressure() -> bool {
+    enabled() && LAST_EVICT_CANDIDATES.load(Ordering::Relaxed) > 0
+}
+
+/// Advances the completed graphics fence so fence-safe eviction & deferred destruction stay exact.
+pub(crate) fn on_graphics_fence_complete(completed: u64) {
+    if !enabled() {
+        return;
+    }
+    if let Ok(mut st) = STATE.try_lock() {
+        st.coherency.completed_deps.graphics =
+            st.coherency.completed_deps.graphics.max(completed);
+    }
+}
+
 /// Records a live CPU->GPU dirty upload range from `host.rs`.
 pub(crate) fn note_cpu_upload(guest_addr: u64, len: u64) {
     if !enabled() || len == 0 {
