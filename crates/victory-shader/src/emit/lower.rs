@@ -4566,7 +4566,12 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        if v.clamp || v.omod != 0 {
+        let clamped_nc = v.clamp
+            && matches!(
+                inst.name(),
+                "v_add_nc_u32" | "v_sub_nc_u32" | "v_subrev_nc_u32"
+            );
+        if (v.clamp && !clamped_nc) || v.omod != 0 {
             return Err("integer output modifiers");
         }
         match v.dst {
@@ -10008,7 +10013,24 @@ impl<'a> Lower<'a> {
                     "v_subrev_nc_u32" => (Bin::Sub, b, a),
                     _ => (Bin::Mul, a, b),
                 };
-                self.s.m.bin(c, op, a, b)
+                let res = self.s.m.bin(c, op, a, b);
+                if matches!(inst.fields, Fields::Valu(ref v) if v.clamp) {
+                    match name {
+                        "v_add_nc_u32" => {
+                            let ovf = self.s.m.cmp(c, pred::IULT, res, a);
+                            let max = k(self, u32::MAX);
+                            self.s.m.select(c, ovf, max, res)
+                        }
+                        "v_sub_nc_u32" | "v_subrev_nc_u32" => {
+                            let under = self.s.m.cmp(c, pred::IULT, a, b);
+                            let z = k(self, 0);
+                            self.s.m.select(c, under, z, res)
+                        }
+                        _ => res,
+                    }
+                } else {
+                    res
+                }
             }
             "v_xnor_b32" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
