@@ -5573,7 +5573,16 @@ impl<'a> Lower<'a> {
     /// that path (a variable set in one arm of a branch, its use behind a flag kept in a
     /// VGPR).
     fn dead(&self, v: Value, seen: &mut Vec<Value>) -> bool {
-        if self.stale.contains(&v) {
+        if self.stale.contains(&v)
+            || matches!(
+                self.vals.get(&v),
+                Some(Val::Missing(
+                    "a constant buffer's descriptor read as data"
+                        | "a descriptor's address or format read as data"
+                        | "a sampler's descriptor read as data"
+                ))
+            )
+        {
             return true;
         }
         let st = self.x.st;
