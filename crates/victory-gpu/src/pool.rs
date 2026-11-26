@@ -42,7 +42,30 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 /// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
-    SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
+    let keep = if crate::ggvl_bridge::vram_under_pressure() {
+        1
+    } else {
+        spares(memory, crate::host::keep_freed())
+    };
+    SPARES.store(keep, Ordering::Relaxed);
+    if crate::ggvl_bridge::vram_under_pressure() {
+        let (_, finished) = crate::host::submissions();
+        let reclaimed: Vec<ID3D12Heap> = {
+            let mut pool = TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+            pool.reclaim_empty(keep, finished, now())
+        };
+        if !reclaimed.is_empty() {
+            let mb = (reclaimed.len() as u64 * BLOCK) / (1024 * 1024);
+            tracing::info!(
+                heaps = reclaimed.len(),
+                reclaimed_mb = mb,
+                "ggvl: reclaimed empty texture pool VRAM heaps under DXGI budget pressure"
+            );
+            for heap in reclaimed {
+                crate::host::retire(heap);
+            }
+        }
+    }
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
@@ -267,6 +290,29 @@ impl<B: Clone> Pool<B> {
 
     fn give(&mut self, piece: Piece, now: u64) {
         self.resting.push_back((now + REST, piece));
+    }
+
+    /// Reclaims fence-safe empty `Block` heaps beyond `keep` spares under VRAM pressure.
+    fn reclaim_empty(&mut self, keep: usize, finished_sub: u64, now: u64) -> Vec<B> {
+        self.rested(now);
+        let mut empty_indices: Vec<usize> = self
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| {
+                let b = b.as_ref()?;
+                (b.free.whole(BLOCK) && b.made <= finished_sub).then_some(i)
+            })
+            .collect();
+        if empty_indices.len() <= keep {
+            return Vec::new();
+        }
+        let drop_count = empty_indices.len() - keep;
+        empty_indices.truncate(drop_count);
+        empty_indices
+            .into_iter()
+            .filter_map(|i| self.blocks[i].take().map(|b| b.memory))
+            .collect()
     }
 
     /// Makes the pieces that rested long enough free, and lets go of empty
