@@ -9058,6 +9058,33 @@ impl Host {
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+        static PER_FRAME_WRITER: std::sync::OnceLock<Mutex<Option<(std::io::BufWriter<std::fs::File>, u64, u64)>>> =
+            std::sync::OnceLock::new();
+        if let Some(path) = std::env::var_os("VICTORY_PER_FRAME_CSV") {
+            let cell = PER_FRAME_WRITER.get_or_init(|| {
+                use std::io::Write;
+                let file = std::fs::OpenOptions::new().create(true).truncate(true).write(true).open(&path).ok();
+                let mut w = file.map(std::io::BufWriter::new);
+                if let Some(ref mut bw) = w {
+                    let _ = writeln!(bw, "frame_id,ts_ms,frame_ms,vram_budget_mb,vram_usage_mb");
+                }
+                Mutex::new(w.map(|bw| (bw, now_ms(), 0u64)))
+            });
+            if let Ok(mut guard) = cell.lock()
+                && let Some((bw, last_ms, count)) = guard.as_mut()
+            {
+                use std::io::Write;
+                let cur = now_ms();
+                let dt = cur.saturating_sub(*last_ms);
+                *last_ms = cur;
+                *count += 1;
+                let (b_mb, u_mb) = crate::ggvl_bridge::vram_snapshot_mb();
+                let _ = writeln!(bw, "{frame},{cur},{dt},{b_mb},{u_mb}");
+                if *count % 60 == 0 {
+                    let _ = bw.flush();
+                }
+            }
+        }
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {

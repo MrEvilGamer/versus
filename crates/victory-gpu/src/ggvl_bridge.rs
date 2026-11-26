@@ -143,6 +143,9 @@ static EVICTED_BYTES: AtomicU64 = AtomicU64::new(0);
 static LAST_BUDGET_BYTES: AtomicU64 = AtomicU64::new(0);
 static LAST_USAGE_BYTES: AtomicU64 = AtomicU64::new(0);
 static RECLAIM_REQUIRED_BYTES: AtomicU64 = AtomicU64::new(0);
+static NEXT_HEAP_ID: AtomicU64 = AtomicU64::new(1);
+static TEX_HEAP_BYTES: AtomicU64 = AtomicU64::new(0);
+static SHADOW_BUF_BYTES: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn vram_snapshot_mb() -> (u64, u64) {
     (
@@ -151,10 +154,13 @@ pub(crate) fn vram_snapshot_mb() -> (u64, u64) {
     )
 }
 
-pub(crate) fn register_texture_heap(heap_id: u64, size_bytes: u64) {
+/// Registers a newly created, resident physical texture pool heap with a stable monotonic ID.
+pub(crate) fn register_texture_heap(size_bytes: u64) -> u64 {
+    let heap_id = NEXT_HEAP_ID.fetch_add(1, Ordering::Relaxed);
     if !enabled() {
-        return;
+        return heap_id;
     }
+    TEX_HEAP_BYTES.fetch_add(size_bytes, Ordering::Relaxed);
     let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let id = 0x8000_0000_0000_0000u64 | heap_id;
     st.registry.register(TrackedAllocation {
@@ -174,12 +180,14 @@ pub(crate) fn register_texture_heap(heap_id: u64, size_bytes: u64) {
         resident: true,
         reclaim_tier: Some(ReclaimTier::EmptyHeap),
     });
+    heap_id
 }
 
-pub(crate) fn unregister_texture_heap(heap_id: u64) {
-    if !enabled() {
+pub(crate) fn unregister_texture_heap(heap_id: u64, size_bytes: u64) {
+    if !enabled() || heap_id == 0 {
         return;
     }
+    TEX_HEAP_BYTES.fetch_sub(size_bytes.min(TEX_HEAP_BYTES.load(Ordering::Relaxed)), Ordering::Relaxed);
     let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let id = 0x8000_0000_0000_0000u64 | heap_id;
     st.registry.unregister(AllocationId(id));
@@ -236,6 +244,8 @@ pub(crate) fn on_vram_budget(budget_bytes: u64, usage_bytes: u64) {
             // on every budget query; reclamation uses the independent pressure bit.
             let evict = st.residency.select_evictions(&st.coherency);
             let tracked_backing_mb = st.registry.total_unique_backing_bytes() >> 20;
+            let tex_heap_mb = TEX_HEAP_BYTES.load(Ordering::Relaxed) >> 20;
+            let shadow_mb = tracked_backing_mb.saturating_sub(tex_heap_mb);
             let reclaim_req_mb = st.controller.reclamation_required_bytes() >> 20;
             let usage_mb = usage_bytes >> 20;
             let unaccounted_mb = usage_mb.saturating_sub(tracked_backing_mb);
@@ -244,6 +254,8 @@ pub(crate) fn on_vram_budget(budget_bytes: u64, usage_bytes: u64) {
                 budget_mb = budget_bytes >> 20,
                 usage_mb,
                 tracked_backing_mb,
+                tex_heap_mb,
+                shadow_mb,
                 unaccounted_mb,
                 reclaim_req_mb,
                 tracked = st.coherency.resources.len(),

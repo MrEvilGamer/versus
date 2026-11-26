@@ -75,7 +75,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
             "ggvl: reclaimed empty texture pool VRAM heaps via fence-safe retirement"
         );
         for heap in reclaimed {
-            crate::ggvl_bridge::unregister_texture_heap(heap.as_raw() as usize as u64);
+            crate::ggvl_bridge::unregister_texture_heap(heap.as_raw() as usize as u64, BLOCK);
             crate::host::retire(heap);
         }
     }
@@ -794,6 +794,9 @@ pub(crate) unsafe fn texture(
         {
             tracing::warn!(error = %e, "a block of texture memory is not resident");
             return None;
+        }
+        if heap.is_some() {
+            let _ = crate::ggvl_bridge::register_texture_heap(BLOCK);
         }
         heap
     })?;
