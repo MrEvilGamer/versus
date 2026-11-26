@@ -9767,9 +9767,22 @@ impl<'a> Lower<'a> {
         };
         let op = if k == 2 { v.dst } else { v.src.get(k).copied() };
         let op = op.ok_or("a missing operand")?;
-        if matches!(op, Operand::Const(_) | Operand::Literal(_)) {
-            // shortcut: no constant operand seen; its high half is not known.
-            return Err("a constant operand of v_pk_fmac_f16");
+        if let Operand::Const(code) = op {
+            // Inline f16 constant in VOP2 v_pk_fmac_f16 broadcasts to both halves.
+            let bits: u16 = match code {
+                128 => 0x0000,
+                240 => 0x3800, // 0.5
+                241 => 0xB800, // -0.5
+                242 => 0x3C00, // 1.0
+                243 => 0xBC00, // -1.0
+                244 => 0x4000, // 2.0
+                245 => 0xC000, // -2.0
+                246 => 0x4400, // 4.0
+                247 => 0xC400, // -4.0
+                248 => 0x3118, // 1/(2*pi)
+                _ => return Err("a constant operand of v_pk_fmac_f16"),
+            };
+            return Ok(self.s.m.i32(u32::from(bits)));
         }
         let x = self.operand(inst, &op)?;
         let c = self.cur;
