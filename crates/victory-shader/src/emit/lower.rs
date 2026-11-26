@@ -5807,6 +5807,27 @@ impl<'a> Lower<'a> {
                     self.set(scc, Val::Bit(s));
                     Ok(())
                 }
+                "s_bfm_b64" => {
+                    let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                    let i64t = self.s.m.int(64);
+                    self.s.flags |= flags::INT64;
+                    let k63 = self.s.m.i32(63);
+                    let a = self.s.m.bin(c, Bin::And, a, k63);
+                    let b = self.s.m.bin(c, Bin::And, b, k63);
+                    let a = self.s.m.cast(c, Cast::ZExt, a, i64t);
+                    let b = self.s.m.cast(c, Cast::ZExt, b, i64t);
+                    let one = self.s.m.int_const(i64t, 1);
+                    let k32 = self.s.m.int_const(i64t, 32);
+                    let m = self.s.m.bin(c, Bin::Shl, one, a);
+                    let m = self.s.m.bin(c, Bin::Sub, m, one);
+                    let r = self.s.m.bin(c, Bin::Shl, m, b);
+                    let rl = self.s.m.cast(c, Cast::Trunc, r, self.s.t.i32);
+                    let rh = self.s.m.bin(c, Bin::LShr, r, k32);
+                    let rh = self.s.m.cast(c, Cast::Trunc, rh, self.s.t.i32);
+                    self.set(lo, Val::I32(rl));
+                    self.set(hi, Val::I32(rh));
+                    Ok(())
+                }
                 "s_mov_b64" => {
                     // Each half by itself: two numbers that travel as a pair (two scalars
                     // parked in neighbouring VGPR lanes, say) need not both have a value.
@@ -6001,6 +6022,30 @@ impl<'a> Lower<'a> {
                 let m = self.s.m.bin(c, Bin::Shl, one, a);
                 let m = self.s.m.bin(c, Bin::Sub, m, one);
                 (self.s.m.bin(c, Bin::Shl, m, b), None)
+            }
+            "s_pack_ll_b32_b16" => {
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let mask = self.s.m.i32(0xFFFF);
+                let k16 = self.s.m.i32(16);
+                let lo16 = self.s.m.bin(c, Bin::And, a, mask);
+                let hi16 = self.s.m.bin(c, Bin::Shl, b, k16);
+                (self.s.m.bin(c, Bin::Or, lo16, hi16), None)
+            }
+            "s_pack_lh_b32_b16" => {
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let lo_mask = self.s.m.i32(0xFFFF);
+                let hi_mask = self.s.m.i32(0xFFFF_0000);
+                let lo16 = self.s.m.bin(c, Bin::And, a, lo_mask);
+                let hi16 = self.s.m.bin(c, Bin::And, b, hi_mask);
+                (self.s.m.bin(c, Bin::Or, lo16, hi16), None)
+            }
+            "s_pack_hh_b32_b16" => {
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let k16 = self.s.m.i32(16);
+                let hi_mask = self.s.m.i32(0xFFFF_0000);
+                let lo16 = self.s.m.bin(c, Bin::LShr, a, k16);
+                let hi16 = self.s.m.bin(c, Bin::And, b, hi_mask);
+                (self.s.m.bin(c, Bin::Or, lo16, hi16), None)
             }
             _ => return Err(name),
         };
@@ -10939,7 +10984,7 @@ impl<'a> Lower<'a> {
             // float format (the console converts by the view's format).
             // One channel goes into a view the program also counts in.
             let counter = *dmask == 1 && self.is_counter(src);
-            if !matches!(*dmask, 0x1 | 0x3 | 0x7 | 0xF) {
+            if !matches!(*dmask, 0x1 | 0x3 | 0x7 | 0xF) || (self.is_counter(src) && !counter) {
                 return Err("an image store of some channels");
             }
             let iu = self.s.m.undef(self.s.t.i32);
