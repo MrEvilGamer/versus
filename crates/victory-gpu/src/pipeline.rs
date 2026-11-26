@@ -648,6 +648,150 @@ pub(crate) extern "system" fn create_compute_x(
     create_compute(this, desc, iid, out)
 }
 
+/// Device method 0x218: precompiled compute pipeline state
+/// (`CreatePreCompiledComputePipelineState` / Xbox D3D12.X).
+/// The four bytecode slices correspond directly to `FSPX` entries
+/// kind 0 (pipeline registers, 0x1c B), kind 1 (pipeline metadata, 0x14 B),
+/// kind 6 (raw GFX10/RDNA2 ISA), and kind 7 (program resource metadata).
+#[repr(C)]
+pub(crate) struct PreCompiledComputeDesc {
+    root: This,
+    packet: Bytecode,
+    pipeline_meta: Bytecode,
+    code: Bytecode,
+    program_meta: Bytecode,
+}
+
+/// Wrap raw precompiled compute blobs into an `FSPX` payload inside a `DXBC`
+/// container with a single `ACCC` part, matching `victory_shader::native::fspx_program`.
+fn pack_fspx_dxbc(
+    packet: &[u8],
+    pipeline_meta: &[u8],
+    code: &[u8],
+    program_meta: &[u8],
+) -> (Vec<u8>, Vec<u8>) {
+    const FSPX_HEADER: usize = 0x10;
+    const ENTRY_COUNT: usize = 4;
+    const DIR_SIZE: usize = FSPX_HEADER + ENTRY_COUNT * 16;
+
+    let entries: [(u32, &[u8]); ENTRY_COUNT] = [
+        (0, packet),
+        (1, pipeline_meta),
+        (6, code),
+        (7, program_meta),
+    ];
+    let payload_len: usize = entries.iter().map(|(_, b)| b.len()).sum();
+    let fspx_len = DIR_SIZE + payload_len;
+
+    let mut fspx = Vec::with_capacity(fspx_len);
+    fspx.extend_from_slice(b"FSPX");
+    fspx.extend_from_slice(&1u32.to_le_bytes()); // FSPX_VERSION
+    fspx.extend_from_slice(&(ENTRY_COUNT as u32).to_le_bytes());
+    fspx.extend_from_slice(&(fspx_len as u32).to_le_bytes());
+
+    let mut offset = DIR_SIZE;
+    for &(kind, data) in &entries {
+        fspx.extend_from_slice(&kind.to_le_bytes());
+        fspx.extend_from_slice(&(offset as u32).to_le_bytes());
+        fspx.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        fspx.extend_from_slice(&0u32.to_le_bytes());
+        offset += data.len();
+    }
+    for &(_, data) in &entries {
+        fspx.extend_from_slice(data);
+    }
+
+    // DXBC container: 0x20 header + 4-byte part offset + 8-byte ACCC header + fspx
+    const DXBC_PART_OFFSET: usize = 0x24;
+    let dxbc_len = DXBC_PART_OFFSET + 8 + fspx.len();
+    let mut dxbc = Vec::with_capacity(dxbc_len);
+    dxbc.extend_from_slice(b"DXBC");
+    dxbc.extend_from_slice(&[0u8; 16]); // digest
+    dxbc.extend_from_slice(&1u16.to_le_bytes()); // major
+    dxbc.extend_from_slice(&0u16.to_le_bytes()); // minor
+    dxbc.extend_from_slice(&(dxbc_len as u32).to_le_bytes());
+    dxbc.extend_from_slice(&1u32.to_le_bytes()); // part count
+    dxbc.extend_from_slice(&(DXBC_PART_OFFSET as u32).to_le_bytes());
+    dxbc.extend_from_slice(b"ACCC");
+    dxbc.extend_from_slice(&(fspx.len() as u32).to_le_bytes());
+    dxbc.extend_from_slice(&fspx);
+
+    (fspx, dxbc)
+}
+
+/// Device method 0x218: precompiled compute pipeline state.
+pub(crate) extern "system" fn create_precompiled_compute(
+    _: This,
+    desc: *const PreCompiledComputeDesc,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static CREATED: AtomicU32 = AtomicU32::new(0);
+    static REJECTED: AtomicU32 = AtomicU32::new(0);
+
+    if !out.is_null() {
+        // SAFETY: caller's out pointer.
+        unsafe { *out = std::ptr::null() };
+    }
+    // SAFETY: the title passes a description (null is tolerated).
+    let Some(desc) = (unsafe { desc.as_ref() }) else {
+        return E_INVALIDARG;
+    };
+    if desc.packet.code.is_null()
+        || desc.packet.size == 0
+        || desc.code.code.is_null()
+        || desc.code.size == 0
+        || desc.program_meta.code.is_null()
+        || desc.program_meta.size == 0
+    {
+        return E_INVALIDARG;
+    }
+    // SAFETY: slices are owned by the caller for the duration of the call.
+    let packet = unsafe { std::slice::from_raw_parts(desc.packet.code, desc.packet.size) };
+    let pipeline_meta = if desc.pipeline_meta.code.is_null() || desc.pipeline_meta.size == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(desc.pipeline_meta.code, desc.pipeline_meta.size) }
+    };
+    let code = unsafe { std::slice::from_raw_parts(desc.code.code, desc.code.size) };
+    let program_meta =
+        unsafe { std::slice::from_raw_parts(desc.program_meta.code, desc.program_meta.size) };
+
+    let (fspx, dxbc) = pack_fspx_dxbc(packet, pipeline_meta, code, program_meta);
+    if let Err(err) = victory_shader::native::fspx_program(&fspx) {
+        let n = REJECTED.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 8 || n.is_power_of_two() {
+            tracing::warn!(
+                rejected = n,
+                packet_len = packet.len(),
+                code_len = code.len(),
+                meta_len = program_meta.len(),
+                error = %err,
+                "0x218 precompiled compute descriptor unsupported; returning E_NOTIMPL"
+            );
+        }
+        return crate::object::E_NOTIMPL;
+    }
+
+    let n = CREATED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 4 || n.is_power_of_two() {
+        tracing::info!(
+            created = n,
+            code_len = code.len(),
+            meta_len = program_meta.len(),
+            "0x218 precompiled compute pipeline created"
+        );
+    }
+    hand_out(
+        vec![shader("compute", &dxbc)],
+        #[cfg(windows)]
+        None,
+        iid,
+        out,
+    )
+}
+
 /// A pipeline described as a stream: its size and the subobjects, each a
 /// type then its data, padded to 8 bytes.
 #[repr(C)]
@@ -905,5 +1049,84 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+
+    #[test]
+    fn precompiled_compute_packs_valid_fspx_dxbc_and_creates_pipeline() {
+        let mut packet = [0u8; 0x1c];
+        packet[0x0c..0x0e].copy_from_slice(&8u16.to_le_bytes()); // threads x
+        packet[0x0e..0x10].copy_from_slice(&8u16.to_le_bytes()); // threads y
+        packet[0x10..0x12].copy_from_slice(&1u16.to_le_bytes()); // threads z
+        packet[0x12..0x14].copy_from_slice(&(1u16 << 4).to_le_bytes()); // wave32
+        let pmeta = [0u8; 0x14];
+        let code = [0x00, 0x00, 0x81, 0xbf]; // s_endpgm (4 bytes = 1 dword)
+        let mut prog_meta = vec![0u8; 0x18 + 32];
+        prog_meta[0..4].copy_from_slice(&0x403u32.to_le_bytes());
+        prog_meta[8..12].copy_from_slice(&1u32.to_le_bytes()); // 1 code dword
+        prog_meta[0x18] = 0x43; // hash/end record
+
+        let desc = PreCompiledComputeDesc {
+            root: std::ptr::null(),
+            packet: Bytecode {
+                code: packet.as_ptr(),
+                size: packet.len(),
+            },
+            pipeline_meta: Bytecode {
+                code: pmeta.as_ptr(),
+                size: pmeta.len(),
+            },
+            code: Bytecode {
+                code: code.as_ptr(),
+                size: code.len(),
+            },
+            program_meta: Bytecode {
+                code: prog_meta.as_ptr(),
+                size: prog_meta.len(),
+            },
+        };
+        let mut p = std::ptr::null();
+        let hr = create_precompiled_compute(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p);
+        assert_eq!(hr, S_OK);
+        assert!(!p.is_null());
+        assert_eq!(pipeline(p).shaders.len(), 1);
+        assert_eq!(pipeline(p).shaders[0].stage, "compute");
+        let parsed = victory_shader::Container::parse(&pipeline(p).shaders[0].container).unwrap();
+        let accc = parsed.part(victory_shader::FourCC::ACCC).unwrap();
+        let prog = victory_shader::native::fspx_program(accc.data).unwrap();
+        assert_eq!(prog.stage, victory_shader::HwStage::Cs);
+        assert_eq!(prog.code, code);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
+    }
+
+    #[test]
+    fn precompiled_compute_rejects_malformed_descriptor() {
+        let packet = [0u8; 0x1c];
+        let code = [0x00, 0x00, 0x81, 0xbf];
+        // Mismatched code dword count (says 99 dwords instead of 1)
+        let mut bad_meta = vec![0u8; 0x18];
+        bad_meta[8..12].copy_from_slice(&99u32.to_le_bytes());
+        let desc = PreCompiledComputeDesc {
+            root: std::ptr::null(),
+            packet: Bytecode {
+                code: packet.as_ptr(),
+                size: packet.len(),
+            },
+            pipeline_meta: Bytecode {
+                code: std::ptr::null(),
+                size: 0,
+            },
+            code: Bytecode {
+                code: code.as_ptr(),
+                size: code.len(),
+            },
+            program_meta: Bytecode {
+                code: bad_meta.as_ptr(),
+                size: bad_meta.len(),
+            },
+        };
+        let mut p = 0x1234usize as This;
+        let hr = create_precompiled_compute(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p);
+        assert_eq!(hr, crate::object::E_NOTIMPL);
+        assert!(p.is_null());
     }
 }

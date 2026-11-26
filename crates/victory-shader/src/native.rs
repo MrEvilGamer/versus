@@ -533,7 +533,8 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
             slot: e[22],
         };
         let sgprs = match root {
-            RootType::Table => 1,
+            RootType::Constants => u.dwords.into(),
+            RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => 1,
             RootType::Descriptor => 2,
             // The code holds its words; no user data.
             RootType::ImmediateSampler => 0,

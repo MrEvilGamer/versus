@@ -388,6 +388,23 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         let first = description
             .as_ref()
             .and_then(|w| words(w[0] as usize));
+        if SLOT == 0x1c8 && calls <= 2 {
+            if let Some(ref w) = description {
+                let gstate = words(w[1] as usize);
+                let pmeta = words(w[3] as usize);
+                let vsmeta = words(w[7] as usize);
+                let psmeta = words(w[11] as usize);
+                tracing::warn!(
+                    slot = "0x1c8",
+                    calls,
+                    gstate = format_args!("{gstate:x?}"),
+                    pmeta = format_args!("{pmeta:x?}"),
+                    vsmeta = format_args!("{vsmeta:x?}"),
+                    psmeta = format_args!("{psmeta:x?}"),
+                    "0x1c8 descriptor sub-blobs"
+                );
+            }
+        }
         tracing::warn!(
             slot = format_args!("{:#x}", SLOT),
             calls,
@@ -452,7 +469,7 @@ static FUNCTIONS: Table<160> = {
     f[57] = unknown_pipeline::<0x1c8> as *const (); // 0x1c8
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
-    f[67] = unknown_pipeline::<0x218> as *const (); // 0x218
+    f[67] = pipeline::create_precompiled_compute as *const (); // 0x218
     f[69] = object::ignore as *const (); // 0x228 debug error filter
     f[70] = descriptor::create_placed_srv as *const (); // 0x230
     f[71] = descriptor::create_placed_uav as *const (); // 0x238
