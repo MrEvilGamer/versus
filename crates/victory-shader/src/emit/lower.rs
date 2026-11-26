@@ -4158,6 +4158,11 @@ impl<'a> Lower<'a> {
             // With console lanes, a mask held as a number is the console's:
             // the lane tests its own bit.
             Atom::Opaque(v) if self.console_lanes => {
+                // A stale descriptor register reaching a lane-mask join on a
+                // dead path is never a live mask; treat its bit as false.
+                if self.dead(v, &mut Vec::new()) {
+                    return Ok(self.s.m.bool(false));
+                }
                 // An opaque mask value from a block that does not dominate `at`
                 // (e.g. propagated through a join across a non-dominating edge)
                 // cannot be read here without creating an invalid forward ref.
