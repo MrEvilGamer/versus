@@ -390,10 +390,18 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     // shrinks by the copies' bytes, at most `card_limits`' second number.
     // (With `card_room_kept_on` the texture queue kept this copy's room
     // free, and the copy may go up to the queue's own line.)
-    if crate::ggvl_bridge::vram_under_pressure() {
+    // Size-tiered priority admission (UGEE Stage C / fxceless#1168):
+    // Reserve half of the card-buffer budget (up to 512 MiB) for large hot
+    // shader-written buffers (>= 4 MiB). Under VRAM pressure, reject small
+    // optional buffers (< 4 MiB) rather than starving large buffers into CPU readbacks.
+    const LARGE_BUF: u64 = 4 << 20;
+    let is_large = size >= LARGE_BUF;
+    let current_card = CARD_BYTES[0].load(Ordering::Relaxed);
+    let large_reserve = (most / 2).min(512 << 20);
+    if !is_large && (crate::ggvl_bridge::vram_under_pressure() || current_card.saturating_add(size) > most.saturating_sub(large_reserve)) {
         return None;
     }
-    let hundredths = 85;
+    let hundredths = if is_large && card_room_kept_on() { 95 } else { 85 };
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 100 * hundredths
     {
