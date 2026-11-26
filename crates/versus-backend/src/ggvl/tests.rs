@@ -247,3 +247,82 @@ fn transfer_range_end_does_not_overflow_at_address_limit() {
     else { panic!("expected upload"); };
     assert_eq!(ranges, vec![(start, u64::MAX)]);
 }
+
+fn test_allocation(id: u64, backing: u64, bytes: u64) -> TrackedAllocation {
+    TrackedAllocation {
+        id: AllocationId(id),
+        backing_id: BackingStorageId(backing),
+        kind: AllocationKind::ShadowBuffer,
+        size_bytes: bytes,
+        segment: MemorySegment::LocalVram,
+        last_access_frame: 0,
+        access_frequency: 0,
+        ownership: OwnershipState::Coherent,
+        descriptor_refs: 0,
+        generation: 0,
+        active_deps: QueueDeps::default(),
+        restoration_cost: 0,
+        evictable: true,
+        resident: true,
+        reclaim_tier: Some(ReclaimTier::ColdShadowBuffer),
+    }
+}
+
+#[test]
+fn backing_eviction_requires_all_aliases_to_be_safe() {
+    let mut reg = AllocationRegistry::new();
+    reg.register(test_allocation(1, 10, 64));
+    reg.register(test_allocation(2, 10, 64));
+    reg.register(test_allocation(3, 20, 64));
+    let completed = QueueDeps::default();
+    reg.get_mut(AllocationId(2)).unwrap().ownership = OwnershipState::GpuAuthoritative;
+    assert_eq!(reg.select_adaptive_evictions(128, completed), vec![AllocationId(3)]);
+    reg.get_mut(AllocationId(2)).unwrap().ownership = OwnershipState::Coherent;
+    reg.get_mut(AllocationId(2)).unwrap().descriptor_refs = 1;
+    assert_eq!(reg.select_adaptive_evictions(128, completed), vec![AllocationId(3)]);
+    reg.get_mut(AllocationId(2)).unwrap().descriptor_refs = 0;
+    reg.get_mut(AllocationId(2)).unwrap().active_deps.copy = 7;
+    assert_eq!(reg.select_adaptive_evictions(128, completed), vec![AllocationId(3)]);
+    assert_eq!(
+        reg.select_adaptive_evictions(128, QueueDeps { copy: 7, ..completed }),
+        vec![AllocationId(1), AllocationId(3)]
+    );
+}
+
+#[test]
+fn backing_accounting_follows_mutation_and_unregister() {
+    let mut reg = AllocationRegistry::new();
+    reg.register(test_allocation(1, 10, 128));
+    reg.register(test_allocation(2, 10, 64));
+    assert_eq!(reg.total_unique_backing_bytes(), 128);
+    reg.unregister(AllocationId(1));
+    assert_eq!(reg.total_unique_backing_bytes(), 64);
+    reg.register(test_allocation(3, 10, 32));
+    reg.get_mut(AllocationId(3)).unwrap().backing_id = BackingStorageId(20);
+    assert_eq!(reg.unique_backing_count(), 2);
+    assert_eq!(reg.total_unique_backing_bytes(), 96);
+}
+
+#[test]
+fn submission_residency_checks_aliases_and_unknown_indirection() {
+    let mut reg = AllocationRegistry::new();
+    reg.register(test_allocation(1, 10, 64));
+    reg.register(test_allocation(2, 10, 64));
+    reg.register(test_allocation(3, 20, 64));
+    reg.get_mut(AllocationId(2)).unwrap().resident = false;
+    reg.get_mut(AllocationId(3)).unwrap().resident = false;
+    assert_eq!(reg.plan_submission_residency(&[AllocationId(1)], false), vec![BackingStorageId(10)]);
+    assert_eq!(reg.plan_submission_residency(&[], true), vec![BackingStorageId(10), BackingStorageId(20)]);
+    assert_eq!(reg.plan_submission_residency(&[AllocationId(999)], false), vec![BackingStorageId(10), BackingStorageId(20)]);
+}
+
+#[test]
+fn adaptive_budget_handles_invalid_samples_and_large_values() {
+    let mut ctrl = AdaptiveVramController::new(1000, 0);
+    ctrl.update(1000, 900);
+    ctrl.update(0, 0);
+    assert_eq!(ctrl.reclamation_required_bytes(), 50);
+    assert_eq!(AdaptiveVramController::new(0, 100).reclamation_required_bytes(), 0);
+    ctrl.update(u64::MAX, u64::MAX);
+    assert_eq!(ctrl.target_usage_bytes(), ((u128::from(u64::MAX) * 85) / 100) as u64);
+}
