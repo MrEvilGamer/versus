@@ -326,3 +326,28 @@ fn adaptive_budget_handles_invalid_samples_and_large_values() {
     ctrl.update(u64::MAX, u64::MAX);
     assert_eq!(ctrl.target_usage_bytes(), ((u128::from(u64::MAX) * 85) / 100) as u64);
 }
+
+#[test]
+fn observed_buffer_write_visits_each_alias_once() {
+    let mut mgr = ResourceCoherencyManager::default();
+    let first = mgr.register(0x10000, 8192, false, ResidencyPriority::High).unwrap();
+    let second = mgr.register(0x10000, 8192, false, ResidencyPriority::High).unwrap();
+    let texture = mgr.register(0x10000, 8192, true, ResidencyPriority::High).unwrap();
+    // Same index page, but outside the exact write interval.
+    let unrelated = mgr.register(0x10800, 16, false, ResidencyPriority::Low).unwrap();
+    let deps = QueueDeps { graphics: 4, compute: 3, copy: 2 };
+    mgr.on_gpu_buffer_write(0x10000, 16, deps).unwrap();
+    for id in [first, second] {
+        let res = &mgr.resources[&id];
+        assert_eq!(res.pages[0].gpu_gen, 1);
+        assert_eq!(res.pages[0].state, PageState::GpuAuthoritative);
+        assert_eq!(res.pages[1].gpu_gen, 0);
+        assert_eq!(res.active_deps, deps);
+    }
+    assert_eq!(mgr.resources[&texture].pages[0].gpu_gen, 1);
+    assert_eq!(mgr.resources[&texture].pages[0].state, PageState::DerivedConversionPending { deps });
+    assert_eq!(mgr.resources[&unrelated].pages[0].gpu_gen, 0);
+    mgr.on_gpu_buffer_write(0x10000, 0, deps).unwrap();
+    assert_eq!(mgr.resources[&first].pages[0].gpu_gen, 1);
+    assert_eq!(mgr.on_gpu_buffer_write(u64::MAX, 1, deps), Err(GgvlError::AddressOverflow));
+}
