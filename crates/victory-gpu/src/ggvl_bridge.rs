@@ -530,4 +530,20 @@ mod lifecycle_tests {
         st.coherency.on_gpu_buffer_write(0x1008, 1, QueueDeps::default()).unwrap();
         assert!(!st.known_readonly_range(0x1000, 16, false));
     }
+
+    #[test]
+    fn texture_heap_registration_retirement_and_duplicate_unregister() {
+        let before = TEX_HEAP_BYTES.load(Ordering::Relaxed);
+        let id1 = register_texture_heap(64 << 20);
+        let id2 = register_texture_heap(64 << 20);
+        assert_ne!(id1, id2);
+        assert_eq!(TEX_HEAP_BYTES.load(Ordering::Relaxed), before + (128 << 20));
+        assert_eq!(unregister_texture_heap(id1), 64 << 20);
+        assert_eq!(TEX_HEAP_BYTES.load(Ordering::Relaxed), before + (64 << 20));
+        // Duplicate unregister must be a safe no-op returning 0.
+        assert_eq!(unregister_texture_heap(id1), 0);
+        assert_eq!(TEX_HEAP_BYTES.load(Ordering::Relaxed), before + (64 << 20));
+        assert_eq!(unregister_texture_heap(id2), 64 << 20);
+        assert_eq!(TEX_HEAP_BYTES.load(Ordering::Relaxed), before);
+    }
 }
