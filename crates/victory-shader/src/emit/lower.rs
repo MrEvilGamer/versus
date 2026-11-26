@@ -5828,6 +5828,35 @@ impl<'a> Lower<'a> {
                     self.set(hi, Val::I32(rh));
                     Ok(())
                 }
+                "s_bitreplicate_b64_b32" => {
+                    let src = src32(self, 0)?;
+                    let spread_dup = |this: &mut Self, mut x: V| -> V {
+                        for (sh, mask) in [
+                            (8u32, 0x00FF_00FFu32),
+                            (4, 0x0F0F_0F0F),
+                            (2, 0x3333_3333),
+                            (1, 0x5555_5555),
+                        ] {
+                            let s = this.s.m.i32(sh);
+                            let m = this.s.m.i32(mask);
+                            let t = this.s.m.bin(c, Bin::Shl, x, s);
+                            let t = this.s.m.bin(c, Bin::Or, x, t);
+                            x = this.s.m.bin(c, Bin::And, t, m);
+                        }
+                        let one = this.s.m.i32(1);
+                        let t = this.s.m.bin(c, Bin::Shl, x, one);
+                        this.s.m.bin(c, Bin::Or, x, t)
+                    };
+                    let m16 = self.s.m.i32(0xFFFF);
+                    let k16 = self.s.m.i32(16);
+                    let lo_in = self.s.m.bin(c, Bin::And, src, m16);
+                    let hi_in = self.s.m.bin(c, Bin::LShr, src, k16);
+                    let rl = spread_dup(self, lo_in);
+                    let rh = spread_dup(self, hi_in);
+                    self.set(lo, Val::I32(rl));
+                    self.set(hi, Val::I32(rh));
+                    Ok(())
+                }
                 "s_mov_b64" => {
                     // Each half by itself: two numbers that travel as a pair (two scalars
                     // parked in neighbouring VGPR lanes, say) need not both have a value.
@@ -6046,6 +6075,12 @@ impl<'a> Lower<'a> {
                 let lo16 = self.s.m.bin(c, Bin::LShr, a, k16);
                 let hi16 = self.s.m.bin(c, Bin::And, b, hi_mask);
                 (self.s.m.bin(c, Bin::Or, lo16, hi16), None)
+            }
+            "s_sext_i32_i16" | "s_sext_i32_i8" => {
+                let a = src32(self, 0)?;
+                let sh = self.s.m.i32(if name == "s_sext_i32_i16" { 16 } else { 24 });
+                let t = self.s.m.bin(c, Bin::Shl, a, sh);
+                (self.s.m.bin(c, Bin::AShr, t, sh), None)
             }
             _ => return Err(name),
         };
@@ -10007,11 +10042,12 @@ impl<'a> Lower<'a> {
                     .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, 31, &[a]);
                 self.s.m.bin(c, Bin::Add, n, b)
             }
-            "v_mad_u32_u24" | "v_mad_i32_i24" => {
+            "v_mad_u32_u24" | "v_mad_i32_i24" | "v_mad_u32_u16" | "v_mad_i32_i16" => {
                 let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let bits = if name.ends_with("16") { 16 } else { 8 };
                 let (sh, op) = (
-                    k(self, 8),
-                    if name == "v_mad_i32_i24" {
+                    k(self, bits),
+                    if name.contains("_i32_") {
                         Bin::AShr
                     } else {
                         Bin::LShr
@@ -12012,13 +12048,16 @@ impl<'a> Lower<'a> {
             let (op, name) = if typed {
                 // shortcut: typed stores are taken to write all four channels
                 // of a float format.
-                if count != 4 || *offen || *offset != 0 {
+                if !(1..=4).contains(&count) || *offen || *offset != 0 {
                     return Err("a typed buffer store of some channels or at an offset");
                 }
                 args.push(self.handle(site, src, false, (10 | u, 0x409))?);
                 args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
                 for x in vals {
                     args.push(self.as_float(x));
+                }
+                for _ in count..4 {
+                    args.push(self.s.m.f32(0));
                 }
                 (69, "bufferStore.f32")
             } else {
