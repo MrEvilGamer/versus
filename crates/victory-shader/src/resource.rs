@@ -2392,6 +2392,11 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
         let (w, at) = (inline(*w)? & 31, inline(*at)? & 31);
         return Some(Moved::Const(((1u32 << w) - 1) << at));
     }
+    if let ("s_bfm_b64", 0 | 1, [Operand::Const(w), Operand::Const(at)]) = (inst.name(), k, &src[..]) {
+        let (w, at) = (inline(*w)? & 63, inline(*at)? & 63);
+        let mask = ((1u64 << w) - 1).wrapping_shl(at);
+        return Some(Moved::Const(if k == 0 { mask as u32 } else { (mask >> 32) as u32 }));
+    }
     let src = src.first()?;
     match (inst.name(), *src) {
         ("s_mov_b32" | "s_mov_b64", Operand::Scalar { code, .. }) if code != NULL => {
