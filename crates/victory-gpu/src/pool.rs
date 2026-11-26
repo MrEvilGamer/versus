@@ -50,6 +50,11 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
     };
     SPARES.store(keep, Ordering::Relaxed);
     let (_, finished) = crate::host::submissions();
+    // Upload blocks live in system memory and have their own retention limit.
+    let released = lock(&STAGING).reclaim_empty(STAGING_KEPT, finished, now());
+    for upload in released {
+        crate::host::retire_resource(upload.0);
+    }
     let (reclaimed, draining_count, stats): (Vec<ID3D12Heap>, usize, PoolStats) = {
         let mut pool = TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
         let reclaimed = pool.reclaim_empty(keep, finished, now());
@@ -146,17 +151,23 @@ impl Ripe {
 static UNRIPE: AtomicU64 = AtomicU64::new(0);
 
 /// The free ranges of a block: start and length, never two that touch.
-struct Ranges(BTreeMap<u64, u64>);
+struct Ranges {
+    ranges: BTreeMap<u64, u64>,
+    available: u64,
+}
 
 impl Ranges {
     fn new(size: u64) -> Ranges {
-        Ranges(BTreeMap::from([(0, size)]))
+        Ranges { ranges: BTreeMap::from([(0, size)]), available: size }
     }
 
     /// Finds the tightest aligned free range for `len` bytes at a multiple of `align`.
     /// Returns `(remaining_bytes_in_range, aligned_start)`.
     fn best_fit_candidate(&self, len: u64, align: u64) -> Option<(u64, u64)> {
-        self.0
+        if self.available < len {
+            return None;
+        }
+        self.ranges
             .iter()
             .filter_map(|(&start, &size)| {
                 let at = start.next_multiple_of(align);
@@ -166,39 +177,45 @@ impl Ranges {
     }
 
     fn total_free(&self) -> u64 {
-        self.0.values().copied().sum()
+        self.available
     }
 
     /// Alignment-aware best-fit allocation for `len` bytes at a multiple of `align`.
     fn take(&mut self, len: u64, align: u64) -> Option<u64> {
-        let (_, target_at) = self.best_fit_candidate(len, align)?;
-        let (&start, &size) = self.0.range(..=target_at).next_back()?;
-        let at = target_at;
-        self.0.remove(&start);
-        if at > start {
-            self.0.insert(start, at - start);
-        }
-        if at + len < start + size {
-            self.0.insert(at + len, start + size - at - len);
-        }
+        let (_, at) = self.best_fit_candidate(len, align)?;
+        self.take_at(at, len);
         Some(at)
     }
 
+    // The caller selected this aligned offset from these same free ranges.
+    fn take_at(&mut self, at: u64, len: u64) {
+        let (&start, &size) = self.ranges.range(..=at).next_back().expect("selected free range");
+        self.ranges.remove(&start);
+        if at > start {
+            self.ranges.insert(start, at - start);
+        }
+        if at + len < start + size {
+            self.ranges.insert(at + len, start + size - at - len);
+        }
+        self.available -= len;
+    }
+
     fn give(&mut self, mut start: u64, mut len: u64) {
-        if let Some((&before, &size)) = self.0.range(..start).next_back()
+        self.available += len;
+        if let Some((&before, &size)) = self.ranges.range(..start).next_back()
             && before + size == start
         {
-            self.0.remove(&before);
+            self.ranges.remove(&before);
             (start, len) = (before, len + size);
         }
-        if let Some(size) = self.0.remove(&(start + len)) {
+        if let Some(size) = self.ranges.remove(&(start + len)) {
             len += size;
         }
-        self.0.insert(start, len);
+        self.ranges.insert(start, len);
     }
 
     fn whole(&self, size: u64) -> bool {
-        self.0.get(&0) == Some(&size)
+        self.ranges.get(&0) == Some(&size)
     }
 }
 
@@ -230,14 +247,11 @@ struct Pool<B> {
     blocks: Vec<Option<Block<B>>>,
     /// Pieces given back, and when each may be used again.
     resting: VecDeque<(u64, Piece)>,
-    /// The empty blocks it was last told to keep, and the most it keeps.
-    spare: usize,
-    most: usize,
 }
 
 impl<B: Clone> Pool<B> {
-    const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most }
+    const fn new() -> Pool<B> {
+        Pool { blocks: Vec::new(), resting: VecDeque::new() }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -274,30 +288,36 @@ impl<B: Clone> Pool<B> {
                 if block.draining || !ripe.is(block) {
                     return None;
                 }
-                let (rem, _at) = block.free.best_fit_candidate(len, align)?;
-                let is_empty = block.free.whole(BLOCK);
-                let total_free = block.free.total_free();
-                Some(((is_empty, total_free, rem, i), i))
+                let (rem, at) = block.free.best_fit_candidate(len, align)?;
+                Some(((block.free.whole(BLOCK), block.free.total_free(), rem, i), (i, at)))
             })
             .min_by_key(|&(key, _)| key)
-            .map(|(_, i)| i);
-        let mut found = best_ripe.and_then(|i| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)));
-        if found.is_none() && ripe.ahead > 0 {
-            // The one that has been there the longest (skipping draining blocks).
-            let mut unripe: Vec<(u64, usize)> = self
+            .map(|(_, fit)| fit);
+        let found = best_ripe.or_else(|| {
+            if ripe.ahead == 0 {
+                return None;
+            }
+            // No ripe block fits. Choose the oldest fitting unripe block.
+            self
                 .blocks
                 .iter()
                 .enumerate()
-                .filter_map(|(i, b)| {
-                    let b = b.as_ref()?;
-                    (!b.draining).then_some((b.made, i))
+                .filter_map(|(i, block)| {
+                    let block = block.as_ref()?;
+                    if block.draining || ripe.is(block) {
+                        return None;
+                    }
+                    let (_, at) = block.free.best_fit_candidate(len, align)?;
+                    Some(((block.made, i), (i, at)))
                 })
-                .collect();
-            unripe.sort_unstable();
-            found = unripe.into_iter().find_map(|(_, i)| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)));
-        }
+                .min_by_key(|&(key, _)| key)
+                .map(|(_, fit)| fit)
+        });
         let (i, start) = match found {
-            Some(found) => found,
+            Some((i, at)) => {
+                self.blocks[i].as_mut()?.free.take_at(at, len);
+                (i, at)
+            }
             None => {
                 let i = self.add(make()?, ripe.started);
                 (i, self.blocks[i].as_mut()?.free.take(len, align)?)
@@ -397,7 +417,7 @@ impl<B: Clone> Pool<B> {
                 empty_blocks += 1;
                 empty_bytes += BLOCK;
             } else {
-                let free_in_block: u64 = block.free.0.values().copied().sum();
+                let free_in_block: u64 = block.free.total_free();
                 fragmented_free_bytes += free_in_block;
                 occupied_bytes += BLOCK.saturating_sub(free_in_block);
             }
@@ -417,6 +437,10 @@ impl<B: Clone> Pool<B> {
     /// Marks up to `max_heaps` sparsely occupied (<= `max_occupancy_pct`%) non-empty
     /// blocks as draining so new allocations stop landing in them.
     fn select_evacuation_heaps(&mut self, max_occupancy_pct: u64, max_heaps: usize) -> usize {
+        let draining = self.blocks.iter().flatten().filter(|b| b.draining).count();
+        if draining >= max_heaps {
+            return 0;
+        }
         let max_occupied = BLOCK.saturating_mul(max_occupancy_pct) / 100;
         let mut candidates: Vec<(u64, usize)> = self
             .blocks
@@ -433,7 +457,7 @@ impl<B: Clone> Pool<B> {
             .collect();
         candidates.sort_unstable();
         let mut marked = 0usize;
-        for (_, i) in candidates.into_iter().take(max_heaps) {
+        for (_, i) in candidates.into_iter().take(max_heaps - draining) {
             if let Some(b) = self.blocks[i].as_mut() {
                 b.draining = true;
                 marked += 1;
@@ -448,6 +472,13 @@ impl<B: Clone> Pool<B> {
         }
     }
 
+    // Released pieces only enter the free ranges after REST. A draining heap
+    // rejects every allocation, including ones that would fit its holes.
+    fn reusable_bytes(&self) -> u64 {
+        self.blocks.iter().flatten().filter(|b| !b.draining).map(|b| b.free.total_free()).sum()
+    }
+
+    #[cfg(any(test, feature = "diagnostics"))]
     fn blocks(&self) -> usize {
         self.blocks.iter().flatten().count()
     }
@@ -470,20 +501,16 @@ struct Upload(ID3D12Resource, *mut u8);
 // SAFETY: the mapping is written by the owners of its pieces, each its own.
 unsafe impl Send for Upload {}
 
-static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT));
-static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT));
+static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new());
+static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new());
 
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Bytes of the pieces textures hold now.
-static HELD: AtomicU64 = AtomicU64::new(0);
-
-/// Bytes of the texture blocks no texture holds: the card's memory in use
-/// by us that new textures take first.
+/// Reusable bytes in texture heaps, for the streaming admission budget.
 pub(crate) fn texture_room() -> u64 {
-    (lock(&TEXTURES).blocks() as u64 * BLOCK).saturating_sub(HELD.load(Ordering::Relaxed))
+    lock(&TEXTURES).reusable_bytes()
 }
 
 /// For the memory line: blocks of textures and of staging buffers, in MiB.
@@ -569,7 +596,6 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
         let left = (*this.cast::<Reclaim>()).references.fetch_sub(1, Ordering::AcqRel) - 1;
         if left == 0 {
             let gone = Box::from_raw(this.cast::<Reclaim>());
-            HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
             lock(&TEXTURES).give(gone.piece, now());
         }
         left
@@ -806,7 +832,6 @@ pub(crate) unsafe fn texture(
     let result = unsafe { device.CreatePlacedResource(&heap, piece.start, &d, state, None, &mut made) };
     match (result, made) {
         (Ok(()), Some(made)) => {
-            HELD.fetch_add(piece.len, Ordering::Relaxed);
             give_back_with(&made, piece);
             made_now(&made);
             #[cfg(feature = "diagnostics")]
@@ -865,7 +890,7 @@ mod tests {
 
     #[test]
     fn pieces_never_overlap_and_rest_before_they_are_used_again() {
-        let mut pool: Pool<u32> = Pool::new(SPARE);
+        let mut pool: Pool<u32> = Pool::new();
         let made = std::cell::Cell::new(0);
         let make = || {
             made.set(made.get() + 1);
@@ -891,17 +916,18 @@ mod tests {
         for p in taken.drain(1..).chain([p, q]) {
             pool.give(p, 20);
         }
-        pool.rested(20 + REST);
+        let reclaimed = pool.reclaim_empty(SPARE, 0, 20 + REST);
+        assert_eq!(reclaimed.len(), blocks.saturating_sub(SPARE));
         assert_eq!(pool.blocks(), blocks.min(SPARE));
         // Too big for a block, and a block that cannot be made.
         assert!(pool.take(BLOCK, 65536, 30, make).is_none());
-        let mut none: Pool<u32> = Pool::new(SPARE);
+        let mut none: Pool<u32> = Pool::new();
         assert!(none.take(65536, 65536, 0, || None).is_none());
     }
 
     #[test]
     fn pieces_come_from_blocks_older_than_the_lists_that_run() {
-        let mut pool: Pool<u64> = Pool::new(SPARE_KEPT);
+        let mut pool: Pool<u64> = Pool::new();
         let made = std::cell::Cell::new(0);
         let make = || {
             made.set(made.get() + 1);
@@ -1012,8 +1038,44 @@ mod tests {
     }
 
     #[test]
+    fn streaming_budget_excludes_resting_and_draining_space() {
+        let mut pool = Pool::new();
+        for id in 0..4 {
+            pool.add(id, 0);
+            pool.blocks[id].as_mut().unwrap().free.take(BLOCK / 8, 1).unwrap();
+        }
+        assert_eq!(pool.select_evacuation_heaps(25, 2), 2);
+        assert_eq!(pool.select_evacuation_heaps(25, 2), 0);
+        let available = 2 * (BLOCK - BLOCK / 8);
+        assert_eq!(pool.reusable_bytes(), available);
+        pool.give(Piece { block: 3, start: 0, len: BLOCK / 8 }, 1);
+        pool.rested(REST);
+        assert_eq!(pool.reusable_bytes(), available);
+        pool.rested(REST + 1);
+        assert_eq!(pool.reusable_bytes(), available + BLOCK / 8);
+        pool.clear_evacuation_flags();
+        assert_eq!(pool.reusable_bytes(), 4 * BLOCK - 3 * BLOCK / 8);
+    }
+
+    #[test]
+    fn staging_burst_retires_only_surplus_empty_blocks_after_rest() {
+        let mut pool = Pool::new();
+        for id in 0..STAGING_KEPT + 4 {
+            pool.add(id, 0);
+            pool.blocks[id].as_mut().unwrap().free.take(512, 512).unwrap();
+            if id != 0 {
+                pool.give(Piece { block: id, start: 0, len: 512 }, 0);
+            }
+        }
+        assert!(pool.reclaim_empty(STAGING_KEPT, 0, REST - 1).is_empty());
+        assert_eq!(pool.reclaim_empty(STAGING_KEPT, 0, REST).len(), 3);
+        assert_eq!(pool.blocks(), STAGING_KEPT + 1);
+        assert!(pool.blocks[0].is_some());
+    }
+
+    #[test]
     fn best_fit_avoids_empty_blocks_and_draining_blocks() {
-        let mut pool: Pool<usize> = Pool::new(8);
+        let mut pool: Pool<usize> = Pool::new();
         let mut next = 0usize;
         let mut mk = || {
             let id = next;

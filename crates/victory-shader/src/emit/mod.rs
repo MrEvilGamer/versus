@@ -464,11 +464,34 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+    emit_container(container, &c, &native, &p, &st, &io, &res)
+}
+
+// These water, reflection and particle compute programs need the wider retry on
+// 32-lane hosts (fxceless/victory-fork#823). Other programs can lose the device
+// with this form. Keep the existing global override for diagnostics.
+fn allow_wave_wide(setting: Option<&str>, hash: &str) -> bool {
+    match setting {
+        Some(value) => value == "1",
+        None => matches!(hash, "5dc3b25986622949" | "6f225b641c5b0708" | "369cbe906ea72764" | "2cc4c197ee29e291"),
+    }
 }
 
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    emit_container(&[], c, native, p, st, io, res)
+}
+
+/// Emits the parsed program with its source container available for scoped wave fallbacks.
+pub fn emit_container(
+    bytes: &[u8],
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
@@ -544,12 +567,13 @@ pub fn emit(
                 }
             }
         }
-        // Off unless asked for (`VICTORY_WAVE_WIDE=1`), for a console wave run as two host
+        // Restricted to known containers by default, for a console wave run as two host
         // waves: this form puts group barriers inside branches and loops, and runs 121-124
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        let setting = std::env::var("VICTORY_WAVE_WIDE").ok();
+        let wide_on = allow_wave_wide(setting.as_deref(), &blake3::hash(bytes).to_hex()[..16]);
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -1126,6 +1150,16 @@ mod tests {
         for (value, mode) in [("0", 0), (" 1 ", 1), ("2", 2)] {
             assert_eq!(super::parse_group_sync(Some(value)), mode);
         }
+    }
+
+    #[test]
+    fn wide_retry_is_scoped_and_respects_an_explicit_override() {
+        for hash in ["5dc3b25986622949", "6f225b641c5b0708", "369cbe906ea72764", "2cc4c197ee29e291"] {
+            assert!(super::allow_wave_wide(None, hash));
+            assert!(!super::allow_wave_wide(Some("0"), hash));
+        }
+        assert!(!super::allow_wave_wide(None, "0000000000000000"));
+        assert!(super::allow_wave_wide(Some("1"), "0000000000000000"));
     }
 
     #[test]
