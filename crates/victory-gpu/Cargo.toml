@@ -15,6 +15,7 @@ anyhow.workspace = true
 victory-formats.workspace = true
 victory-pipeline.workspace = true
 victory-shader.workspace = true
+versus-backend.workspace = true
 
 [build-dependencies]
 blake3.workspace = true

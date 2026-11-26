@@ -9248,6 +9248,7 @@ impl Host {
                 .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut shared)
                 .ok()?;
         }
+        crate::ggvl_bridge::on_vram_budget(own.Budget, own.CurrentUsage);
         // The card's budget moved by 256 MB or more since the last look:
         // said at once, with what was in use at the last look, so the log
         // has the moment. (It fell from 11,242 MB to some 10,300 MB with
@@ -9288,6 +9289,7 @@ impl Host {
                 .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut shared)
                 .ok()?;
         }
+        crate::ggvl_bridge::on_vram_budget(own.Budget, own.CurrentUsage);
         let all = |m: &DXGI_QUERY_VIDEO_MEMORY_INFO| {
             [m.Budget, m.CurrentUsage, m.AvailableForReservation, m.CurrentReservation]
         };

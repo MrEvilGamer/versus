@@ -33,6 +33,8 @@ mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
+#[cfg(windows)]
+pub(crate) mod ggvl_bridge;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod book;
 #[cfg(windows)]
