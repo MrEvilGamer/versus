@@ -2594,7 +2594,25 @@ impl<'a> Lower<'a> {
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
-            Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
+            Input::GroupInfo => {
+                // GFX10/RDNA2 TG_SIZE_EN SGPR: bits 0..5 = num_waves_in_tg, bits 20..25 = wave_id_in_tg.
+                let Some([tx, ty, tz]) = self.s.threads else {
+                    return Val::Missing("the thread-group info SGPR");
+                };
+                let wave = self.wave();
+                let num_waves = (tx * ty * tz).div_ceil(wave);
+                let flat = self.compute_id("flattenedThreadIdInGroup.i32", 96, 0);
+                let Val::I32(f) = flat else {
+                    unreachable!()
+                };
+                let e = self.s.entry;
+                let shift = self.s.m.i32(wave.trailing_zeros());
+                let wave_id = self.s.m.bin(e, Bin::LShr, f, shift);
+                let k20 = self.s.m.i32(20);
+                let hi = self.s.m.bin(e, Bin::Shl, wave_id, k20);
+                let lo = self.s.m.i32(num_waves & 0x3F);
+                return Val::I32(self.s.m.bin(e, Bin::Or, hi, lo));
+            }
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
                     unreachable!()

@@ -13,7 +13,8 @@
 3. **`9bb7d5f` & `ae08fb7`:** Supported two-term computed addresses (`Address::dynamic2` → `0` remaining `"two computed terms"` errors) and prefix-`dmask` `image_store` (`+39` host PSOs restored: `165 → 204`).
 4. **Cycle 1 (`3cc9155`):** `s_pack_ll_b32_b16` (`20 → 0`), `s_pack_hh_b32_b16` (`15 → 0`), `s_bfm_b64` (`4 → 0`), counter-texture `image_store` guard (`8` shaders restored: `712 → 704`).
 5. **Cycle 2 (`20318bb`):** `v_mad_u32_u16`/`v_mad_i32_i16` (`5 → 0`), `s_sext_i32_i16`/`s_sext_i32_i8` (`1 → 0`), `s_bitreplicate_b64_b32`, and 1–3 channel typed `bufferStore.f32` (`35 → 0`). **`32` more shaders fully restored (`704 → 672`), `host_created: 204 → 244` (+40)!**
-6. **Cycle 3:** Enabled `made_raw` for `tbuffer_*_format` instructions in `resource.rs` — **204 shaders advanced** past `"a descriptor changed after loading"` (`316 → 112`). Top remaining bottlenecks are now `"an address not from a root parameter"` (`241`), `"a descriptor outside the heaps"` (`131`), `"a descriptor changed after loading"` (`112`), and `"a descriptor neither loaded nor built"` (`65`).
+6. **Cycle 3 (`d41330e`):** Enabled `made_raw` for `tbuffer_*_format` instructions in `resource.rs` — **204 shaders advanced** past `"a descriptor changed after loading"` (`316 → 112`).
+7. **Cycle 4:** Implemented `Input::GroupInfo` (`TG_SIZE_EN` SGPR) in `lower.rs` — **`the thread-group info SGPR`: `6 → 0`**, **`4` more shaders fully restored (`672 → 668`), `host_created: 244 → 248`!**
 
 ## Remaining Top Shader Failure Categories (Baseline `ae08fb7`)
 | Unique Shaders | Category |
