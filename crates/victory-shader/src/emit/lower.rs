@@ -4134,7 +4134,23 @@ impl<'a> Lower<'a> {
             // With console lanes, a mask held as a number is the console's:
             // the lane tests its own bit.
             Atom::Opaque(v) if self.console_lanes => {
-                let hi = match self.pair_high(v) {
+                // An opaque mask value from a block that does not dominate `at`
+                // (e.g. propagated through a join across a non-dominating edge)
+                // cannot be read here without creating an invalid forward ref.
+                let hi_val = self.pair_high(v);
+                if self
+                    .def_block
+                    .get(&v)
+                    .is_some_and(|&db| self.rpo[db] > self.rpo[self.cur_ir])
+                    || hi_val.is_some_and(|h| {
+                        self.def_block
+                            .get(&h)
+                            .is_some_and(|&db| self.rpo[db] > self.rpo[self.cur_ir])
+                    })
+                {
+                    return Err("an opaque lane mask");
+                }
+                let hi = match hi_val {
                     Some(h) => Some(self.get(h)?),
                     None => None,
                 };
@@ -12854,6 +12870,7 @@ impl<'a> Lower<'a> {
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                self.cur_ir = q;
                 let x = self.boolean(args[n], qb).map_err(|w| unsupported(offset, w))?;
                 incoming.push((x, qb));
             }

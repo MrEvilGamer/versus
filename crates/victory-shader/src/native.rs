@@ -464,7 +464,7 @@ pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
 ///         records, u8 0; then 32-byte records from +0x18, each a u32 tag:
 ///   0x41  a resource the code reads: u8 resource type (as FSSM's used
 ///         entries), u8 root type, u16 0, u32 table offset (dwords), u32
-///         register, u32 view dimension (1 buffer, 4 2D, 0 root view),
+///         register, u32 stride (bytes: 1 raw buffer, >=4 structured, 0 CBV),
 ///         u8 descriptor dwords, u8 user-data dword, u8 root slot, u8 0,
 ///         u32 -1, u32 0
 ///   0x42  a view declaration: u32 0, u8 1, u8 class (0 SRV, 1 UAV),
@@ -527,7 +527,7 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
             root,
             table_offset_dwords: le32(e, 8),
             lower_bound: le32(e, 12),
-            stride: 0,
+            stride: le32(e, 16),
             dwords: e[20],
             user_data: e[21],
             slot: e[22],
