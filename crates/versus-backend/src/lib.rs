@@ -72,20 +72,19 @@ const SHARED_DEFAULTS: &[(&str, &str)] = &[
     ("VICTORY_METER_THREAD", "1"),
     ("VICTORY_WAIT_RESIDENT", "0"),
     ("VICTORY_GGVL_SKIP_READONLY_HASH", "1"),
-];
-
-/// Conservative defaults for 16 GB RAM / 6-core CPUs (no core pinning, tight RAM cap, safe visuals).
-const TIER_16GB_DEFAULTS: &[(&str, &str)] = &[
+    // Neutral graphics quality defaults (independently overridable via env vars).
     ("VICTORY_DISPLAY_MODE", "960x540"),
     ("VICTORY_MAX_TEXTURE_DIM", "512"),
+];
+
+/// Conservative memory/CPU budgets for 16 GB RAM / 6-core CPUs (no core pinning, tight RAM cap).
+const TIER_16GB_DEFAULTS: &[(&str, &str)] = &[
     ("VICTORY_CARD_BUFFERS_MB", "512"),
     ("VICTORY_WINDOW_BUDGET_MB", "512"),
 ];
 
-/// High-throughput defaults for 32 GB+ RAM / >12-thread CPUs.
+/// Higher memory/CPU budgets for 32 GB+ RAM / >12-thread CPUs.
 const TIER_32GB_DEFAULTS: &[(&str, &str)] = &[
-    ("VICTORY_DISPLAY_MODE", "640x360"),
-    ("VICTORY_MAX_TEXTURE_DIM", "256"),
     ("VICTORY_CARD_BUFFERS_MB", "1024"),
     ("VICTORY_WINDOW_BUDGET_MB", "2048"),
     ("VICTORY_LANE_CORE", "1"),
