@@ -389,20 +389,25 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
             .as_ref()
             .and_then(|w| words(w[0] as usize));
         if SLOT == 0x1c8 && calls <= 2 {
-            if let Some(ref w) = description {
-                let gstate = words(w[1] as usize);
-                let pmeta = words(w[3] as usize);
-                let vsmeta = words(w[7] as usize);
-                let psmeta = words(w[11] as usize);
-                tracing::warn!(
-                    slot = "0x1c8",
-                    calls,
-                    gstate = format_args!("{gstate:x?}"),
-                    pmeta = format_args!("{pmeta:x?}"),
-                    vsmeta = format_args!("{vsmeta:x?}"),
-                    psmeta = format_args!("{psmeta:x?}"),
-                    "0x1c8 descriptor sub-blobs"
-                );
+            if let (Some(w), Some(dir)) = (description.as_ref(), std::env::var_os("VICTORY_DUMP_1C8")) {
+                let dir = std::path::PathBuf::from(dir);
+                let _ = std::fs::create_dir_all(&dir);
+                for (name, ptr_i, len_i) in [
+                    ("gstate", 1usize, 2usize),
+                    ("pmeta", 3, 4),
+                    ("vs_code", 5, 6),
+                    ("vs_meta", 7, 8),
+                    ("ps_code", 9, 10),
+                    ("ps_meta", 11, 12),
+                ] {
+                    let (ptr, len) = (w[ptr_i] as usize, w[len_i] as usize);
+                    if ptr != 0 && len > 0 && len <= 1 << 20 {
+                        let mut buf = vec![0u8; len];
+                        if crate::host::read_into(ptr as *const u8, &mut buf) {
+                            let _ = std::fs::write(dir.join(format!("call{calls}_{name}.bin")), &buf);
+                        }
+                    }
+                }
             }
         }
         tracing::warn!(
