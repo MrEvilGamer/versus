@@ -1,6 +1,6 @@
-# Starts the title with the settings this fork is played with (README.md, "How to run it").
+# Starts Versus with the inherited gameplay settings and backend defaults (README.md).
 #   scripts\play.ps1 -Exe <path of your own copy's executable>
-# -Safe         without the newer, faster ways (the first thing to try when something is wrong)
+# -Safe         disable selected experimental paths, including GGVL hash bypass
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -More         other settings: -More @{VICTORY_PANEL='1'}
@@ -20,19 +20,44 @@ $settings = @{
 }
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
+    $settings.VICTORY_GGVL_SKIP_READONLY_HASH = '0'
 } else {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
-foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
+foreach ($k in $More.Keys) {
+    if ($k -notmatch '^VICTORY_[A-Za-z0-9_]+
+) { throw "Invalid Versus setting: $k" }
+    $settings[$k] = $More[$k]
+}
 
-$victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
-if (-not (Test-Path $victory)) { Write-Host "No $victory. Build it first (README.md)."; return }
-if (-not (Test-Path $Exe)) { Write-Host "No $Exe."; return }
-# (Other settings left over in this window go; where your files are stays.)
+$victory = Join-Path $PSScriptRoot "..\target\$Build\versus.exe"
+if (-not (Test-Path -LiteralPath $victory -PathType Leaf)) {
+    throw "No $victory. Build it first (README.md)."
+}
+if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) { throw "No executable at $Exe." }
+$victory = (Resolve-Path -LiteralPath $victory).Path
+$Exe = (Resolve-Path -LiteralPath $Exe).Path
+
+# Apply a clean profile to the child process, then restore the caller's environment.
 $paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR'
-Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
-foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
-$Exe = (Resolve-Path $Exe).Path
+$previous = @{}
+Get-ChildItem Env: | Where-Object { $_.Name -like 'VICTORY_*' } | ForEach-Object {
+    $previous[$_.Name] = $_.Value
+}
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
-try { & $victory run $Exe --execute } finally { Pop-Location }
+try {
+    foreach ($k in $previous.Keys) {
+        if ($k -notin $paths) { Remove-Item -LiteralPath "Env:$k" -ErrorAction Stop }
+    }
+    foreach ($k in $settings.Keys) { Set-Item -LiteralPath "Env:$k" $settings[$k] -ErrorAction Stop }
+    & $victory run $Exe --execute
+    $result = $LASTEXITCODE
+} finally {
+    Get-ChildItem Env: | Where-Object { $_.Name -like 'VICTORY_*' } | ForEach-Object {
+        Remove-Item -LiteralPath "Env:$($_.Name)"
+    }
+    foreach ($k in $previous.Keys) { Set-Item -LiteralPath "Env:$k" $previous[$k] }
+    Pop-Location
+}
+exit $result
