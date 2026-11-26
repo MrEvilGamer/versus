@@ -7928,8 +7928,17 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if let Some(rest) = name.strip_prefix("v_cmp_").or(name.strip_prefix("v_cmpx_")) {
-            let r = if v.dpp.is_some() {
-                Err("a compare with DPP")
+            let r = if let Some(d) = v.dpp {
+                match self.dpp(inst, d) {
+                    Ok((x, None)) => {
+                        self.src0 = Some(x);
+                        let res = self.compare(inst, rest);
+                        self.src0 = None;
+                        res
+                    }
+                    Ok((_, Some(_))) => Err("a compare with DPP"),
+                    Err(why) => Err(why),
+                }
             } else {
                 self.compare(inst, rest)
             };

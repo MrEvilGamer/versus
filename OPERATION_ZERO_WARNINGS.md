@@ -23,7 +23,8 @@
 13. **Cycle 11 (`f2242ef`):** Implemented `s_absdiff_i32` in `lower.rs` — **`s_absdiff_i32`: `7 → 0`**, **`0x218` host D3D12 PSOs crossed 300+ (`299 → 301`, `+136` total since `1dfee4a`), `0` errors!**
 14. **Cycle 12 (`6c80ada`):** Implemented 64-bit scalar base + 32-bit VGPR offset (`saddr`) for `global_load_*`/`global_store_*` in `lower.rs` — **`a global address with a scalar base`: `2 → 0`**, **`2` more shaders fully restored (`614 → 612`), `host_created: 301 → 303`, `0` errors!**
 15. **Cycle 13 (`9ef0da5`):** Added `VICTORY_DUMP_1C8` capture hook and `tools/dump_1c8.py`, decoding `0x1C8` `pmeta` (input layout), `vs_meta`/`ps_meta` (`0x10` header + `0x41`/`0x42`/`0x43` `FSPX` records), and `gstate` (RDNA2 registers).
-16. **Cycle 14:** Implemented IEEE-754 `v_ldexp_f32` in `lower.rs` — **`v_ldexp_f32`: `2 → 0` (16th category eliminated!)**, **Total `WARN`: `633` (`29` categories), `host_created: 304` (`+139` total since `1dfee4a`), `0` errors!**
+16. **Cycle 14 (`8d79b83`):** Implemented IEEE-754 `v_ldexp_f32` in `lower.rs` — **`v_ldexp_f32`: `2 → 0`**, **Total `WARN`: `633` (`29` categories), `host_created: 304`, `0` errors!**
+17. **Cycle 15:** Implemented DPP source modifier support for `v_cmp_*`/`v_cmpx_*` in `lower.rs` — **`a compare with DPP`: `1 → 0` (17th category eliminated!)**, **Total `WARN`: `631` (`28` categories), `host_created: 305` (`+140` total since `1dfee4a`), `0` errors!**
 
 ## Remaining Top Shader Failure Categories (Baseline `ae08fb7`)
 | Unique Shaders | Category |
