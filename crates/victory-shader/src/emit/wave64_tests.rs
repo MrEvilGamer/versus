@@ -167,7 +167,7 @@ fn a_sum_of_halves_over_the_wave_is_the_consoles_tree_bit_for_bit() {
     let native = native(&words);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     assert_eq!(p.blocks.iter().flat_map(|b| &b.insts).filter(|i| i.name() == "v_add_f16").count(), 6);
-    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    let shader = lowered_counted(&native, &p, &HashSet::new(), 64, false).expect("lower");
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
         v.validate(&mut copy).expect("DXIL validation failed");
@@ -634,7 +634,7 @@ fn a_lane_mask_joined_with_a_number_is_read_as_the_number_it_is() {
     ];
     let native = native_of(&words, false, 32);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    let shader = lowered_counted(&native, &p, &HashSet::new(), 64, false).expect("lower");
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
         v.validate(&mut copy).expect("DXIL validation failed");
@@ -695,6 +695,42 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
         assert_eq!(got, expected, "{below} lanes inside, s1 = {s1}");
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
+}
+
+/// Regression test for shader `f701e815650eaa2e`: `s_and_b64 dst, vcc, exec` sets
+/// `SCC = (vcc & exec) != 0` (`WaveActiveAnyTrue`), which is then read as data via
+/// `src_scc` (`s_mul_i32 dst, const, src_scc`) without any other cross-lane op.
+/// Must set `console_lanes` and produce exact Wave64 results on a Wave32 host.
+#[test]
+fn scc_of_and_with_exec_read_via_src_scc_matches_cpu_reference() {
+    let words = [
+        // v_cmp_eq_u32 vcc, s0, v0 (true for lane == s0)
+        0x7d84_0000,
+        // s_and_b64 s[16:17], vcc, exec (sets SCC = any active lane == s0)
+        0x8710_7e6a,
+        // s_add_u32 s1, 42, src_scc (s1 = SCC ? 43 : 42)
+        0x8001_fdaa,
+        // v_mov_b32 v5, s1
+        0x7e0a_0201,
+        // buffer_store_dword v5, off, s[8:11], 0
+        0xe070_0000,
+        0x80 << 24 | 2 << 16 | 5 << 8,
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    lower::set_host_max_wave(32);
+    let native = native_of(&words, true, 64);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered_counted(&native, &p, &HashSet::new(), 64, false).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    // s0 in 0..64 -> some lane matches -> SCC = 1 -> 43; s0 >= 64 -> no lane matches -> SCC = 0 -> 42.
+    // Note: lane 0..31 are in half 0, lane 32..63 are in half 1; both halves must agree!
+    for (target_lane, expected) in [(0u32, 43u32), (31, 43), (32, 43), (63, 43), (64, 42), (99, 42)] {
+        let Some(got) = on_the_card(&shader, [target_lane, 0]) else { return };
+        assert_eq!(got, expected, "target_lane = {target_lane}");
+    }
 }
 
 /// A dispatch counted in threads: of the last group only the lanes below the

@@ -1802,7 +1802,7 @@ fn dynamic_slots(count: u32, null: u32) -> u32 {
         std::env::var("VICTORY_DYNAMIC_SLOTS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(DYNAMIC << 2)
+            .unwrap_or(DYNAMIC << 1)
     });
     // Room past the title's own slots; where the title reaches past the
     // host's cap there is none. Then the pool has to come out of the

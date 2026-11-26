@@ -1194,6 +1194,11 @@ thread_local! {
 }
 
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
+    if !i.name().starts_with("s_cbranch_")
+        && i.read(Reg::Scc).is_some_and(|v| st.scc_some.contains_key(&v))
+    {
+        return true;
+    }
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let ops: Vec<&Operand> = match &i.fields {
         // A mask operation (its result a mask) is no data use.
