@@ -58,6 +58,7 @@ const NVIDIA_DEFAULTS: &[(&str, &str)] = &[
     ("VICTORY_LANE_CORE", "1"),
     ("VICTORY_WAIT_RESIDENT", "0"),
     ("VICTORY_GGVL_SKIP_READONLY_HASH", "1"),
+    ("VICTORY_WINDOW_BUDGET_MB", "2048"),
 ];
 
 /// Applies Versus's NVIDIA-first defaults to the process environment.
