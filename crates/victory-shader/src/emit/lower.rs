@@ -3317,17 +3317,34 @@ impl<'a> Lower<'a> {
         else {
             unreachable!()
         };
-        if *lds || !matches!(saddr, None | Some(Operand::Scalar { code: NULL, .. })) {
+        if *lds {
             return Err("a global address with a scalar base");
         }
         let Some(Operand::Vector { reg: areg, .. }) = *addr else {
             return Err("a global address not in VGPRs");
         };
-        let word = |l: &mut Self, k: u8| -> Result<V, Why> {
-            let v = inst.read(Reg::V(areg + k)).ok_or("a global address")?;
-            l.i32_of(v)
+        let (lo, hi) = match *saddr {
+            None | Some(Operand::Scalar { code: NULL, .. }) => {
+                let word = |l: &mut Self, k: u8| -> Result<V, Why> {
+                    let v = inst.read(Reg::V(areg + k)).ok_or("a global address")?;
+                    l.i32_of(v)
+                };
+                (word(self, 0)?, word(self, 1)?)
+            }
+            Some(Operand::Scalar { code, .. }) => {
+                let s0 = inst.read(Reg::S(code)).ok_or("a global scalar base")?;
+                let s1 = inst.read(Reg::S(code + 1)).ok_or("a global scalar base")?;
+                let v0 = inst.read(Reg::V(areg)).ok_or("a global address")?;
+                let (slo, shi, voff) = (self.i32_of(s0)?, self.i32_of(s1)?, self.i32_of(v0)?);
+                let c = self.cur;
+                let lo = self.s.m.bin(c, Bin::Add, slo, voff);
+                let carry = self.s.m.cmp(c, pred::IULT, lo, slo);
+                let carry = self.s.m.cast(c, Cast::ZExt, carry, self.s.t.i32);
+                let hi = self.s.m.bin(c, Bin::Add, shi, carry);
+                (lo, hi)
+            }
+            _ => return Err("a global address with a scalar base"),
         };
-        let (lo, hi) = (word(self, 0)?, word(self, 1)?);
         let (lo, hi) = self.address_plus(lo, hi, i32::from(*offset));
         let guard = self.guard(b, i)?;
         let (i32t, res, void) = (self.s.t.i32, self.s.t.res_ret, self.s.t.void);

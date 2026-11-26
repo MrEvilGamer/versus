@@ -20,7 +20,8 @@
 10. **Cycle 8 (`5643e6d`):** Allowed `vcc_lo`/`vcc_hi` (`106 | 107`) in `ir::unspill::parked()` (`ir.rs`) so spill VGPRs like `v141` are promoted to scalar moves (`a descriptor neither loaded nor built`: `65 → 63`, `0` errors).
 11. **Cycle 9 (`fa79fdc`):** Implemented `ds_append`/`ds_consume` LDS atomics in `lower.rs` (`an LDS address`: `2 → 0`) and separated expected physical-section aliased texture re-uploads (`blocks_shown_elsewhere >= 1`, `tracing::debug!`) from genuine unaliased texture changes (`tracing::warn!`, `0` occurrences) in `draw.rs`. **Total `WARN`: `887 → 687` (`-200`), unique categories: `44 → 31`, `0` errors!**
 12. **Cycle 10 (`2837c4e`):** Added `s_bfm_b64` constant folding in `resource.rs` — **`an address not from a root parameter`: `241 → 0` (100% eliminated!)**, **`56` ray-tracing shaders fully restored (`663 → 607`), `host_created: 252 → 299`, Total `WARN`: `687 → 630`, `0` errors!**
-13. **Cycle 11:** Implemented `s_absdiff_i32` in `lower.rs` — **`s_absdiff_i32`: `7 → 0`**, **`0x218` host D3D12 PSOs crossed 300+ (`299 → 301`, `+136` total since `1dfee4a`), `0` errors!**
+13. **Cycle 11 (`f2242ef`):** Implemented `s_absdiff_i32` in `lower.rs` — **`s_absdiff_i32`: `7 → 0`**, **`0x218` host D3D12 PSOs crossed 300+ (`299 → 301`, `+136` total since `1dfee4a`), `0` errors!**
+14. **Cycle 12:** Implemented 64-bit scalar base + 32-bit VGPR offset (`saddr`) for `global_load_*`/`global_store_*` in `lower.rs` — **`a global address with a scalar base`: `2 → 0`**, **`2` more shaders fully restored (`614 → 612`), `host_created: 301 → 303` (`+138` total since `1dfee4a`), `30` warning categories, `0` errors!**
 
 ## Remaining Top Shader Failure Categories (Baseline `ae08fb7`)
 | Unique Shaders | Category |
