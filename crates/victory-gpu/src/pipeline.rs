@@ -418,8 +418,46 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// `0x218` or `0x1c8` for precompiled pipelines, `0` otherwise.
+    precompiled_slot: u16,
+    /// Whether a host pipeline from this precompiled PSO has executed.
+    executed: std::sync::atomic::AtomicBool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
+
+/// Stage-by-stage counters for precompiled Xbox D3D12.X pipelines (`0x218` and `0x1c8`):
+/// `[0]=accepted, [1]=parsed, [2]=rejected, [3]=host_created, [4]=host_failed, [5]=executed, [6]=dropped`.
+pub(crate) static PRECOMPILED_218: [std::sync::atomic::AtomicU32; 7] =
+    [const { std::sync::atomic::AtomicU32::new(0) }; 7];
+pub(crate) static PRECOMPILED_1C8: [std::sync::atomic::AtomicU32; 7] =
+    [const { std::sync::atomic::AtomicU32::new(0) }; 7];
+
+pub(crate) fn precompiled_counters(slot: u16) -> Option<&'static [std::sync::atomic::AtomicU32; 7]> {
+    match slot {
+        0x218 => Some(&PRECOMPILED_218),
+        0x1c8 => Some(&PRECOMPILED_1C8),
+        _ => None,
+    }
+}
+
+pub(crate) fn log_precompiled_summary(slot: u16, trigger: &'static str) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some(c) = precompiled_counters(slot) else {
+        return;
+    };
+    tracing::info!(
+        slot = format_args!("{slot:#x}"),
+        trigger,
+        accepted = c[0].load(Relaxed),
+        parsed = c[1].load(Relaxed),
+        rejected = c[2].load(Relaxed),
+        host_created = c[3].load(Relaxed),
+        host_failed = c[4].load(Relaxed),
+        executed = c[5].load(Relaxed),
+        dropped = c[6].load(Relaxed),
+        "precompiled pipeline stage telemetry"
+    );
+}
 
 /// Stage names, in description order.
 const GRAPHICS_STAGES: [&str; 5] = ["vertex", "pixel", "domain", "hull", "geometry"];
@@ -453,7 +491,22 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     if this.is_null() {
         return None;
     }
-    make::ready(&pipeline(this).host)
+    let p = pipeline(this);
+    let ready = make::ready(&p.host);
+    if let Some(c) = precompiled_counters(p.precompiled_slot) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if ready.is_some() {
+            if !p.executed.swap(true, Relaxed) {
+                let n = c[5].fetch_add(1, Relaxed) + 1;
+                if n <= 4 || n.is_power_of_two() {
+                    log_precompiled_summary(p.precompiled_slot, "executed");
+                }
+            }
+        } else {
+            c[6].fetch_add(1, Relaxed);
+        }
+    }
+    ready
 }
 
 /// Host pipelines queued and not made yet.
@@ -562,9 +615,30 @@ fn hand_out(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    hand_out_slot(
+        shaders,
+        #[cfg(windows)]
+        graphics,
+        0,
+        iid,
+        out,
+    )
+}
+
+fn hand_out_slot(
+    shaders: Vec<Arc<Shader>>,
+    #[cfg(windows)] graphics: Option<Box<host::GraphicsState>>,
+    precompiled_slot: u16,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
-    let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    let host = Arc::new(make::Pending::new_with_slot(
+        shaders.clone(),
+        graphics,
+        precompiled_slot,
+    ));
     #[cfg(windows)]
     known::note(host.key(), &shaders, host.graphics.as_deref());
     #[cfg(windows)]
@@ -585,8 +659,10 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        precompiled_slot,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
+        executed: std::sync::atomic::AtomicBool::new(false),
     });
     object::hand_out(PIPELINE, pipeline, iid, &PIPELINE_IIDS, out)
 }
@@ -726,9 +802,7 @@ pub(crate) extern "system" fn create_precompiled_compute(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static CREATED: AtomicU32 = AtomicU32::new(0);
-    static REJECTED: AtomicU32 = AtomicU32::new(0);
+    use std::sync::atomic::Ordering;
 
     if !out.is_null() {
         // SAFETY: caller's out pointer.
@@ -759,8 +833,9 @@ pub(crate) extern "system" fn create_precompiled_compute(
         unsafe { std::slice::from_raw_parts(desc.program_meta.code, desc.program_meta.size) };
 
     let (fspx, dxbc) = pack_fspx_dxbc(packet, pipeline_meta, code, program_meta);
+    PRECOMPILED_218[0].fetch_add(1, Ordering::Relaxed);
     if let Err(err) = victory_shader::native::fspx_program(&fspx) {
-        let n = REJECTED.fetch_add(1, Ordering::Relaxed) + 1;
+        let n = PRECOMPILED_218[2].fetch_add(1, Ordering::Relaxed) + 1;
         if n <= 8 || n.is_power_of_two() {
             tracing::warn!(
                 rejected = n,
@@ -774,19 +849,20 @@ pub(crate) extern "system" fn create_precompiled_compute(
         return crate::object::E_NOTIMPL;
     }
 
-    let n = CREATED.fetch_add(1, Ordering::Relaxed) + 1;
+    let n = PRECOMPILED_218[1].fetch_add(1, Ordering::Relaxed) + 1;
     if n <= 4 || n.is_power_of_two() {
         tracing::info!(
-            created = n,
+            parsed = n,
             code_len = code.len(),
             meta_len = program_meta.len(),
-            "0x218 precompiled compute pipeline created"
+            "0x218 precompiled compute pipeline parsed"
         );
     }
-    hand_out(
+    hand_out_slot(
         vec![shader("compute", &dxbc)],
         #[cfg(windows)]
         None,
+        0x218,
         iid,
         out,
     )

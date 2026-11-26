@@ -46,6 +46,7 @@ pub(crate) struct Pending {
     /// Cumulative microseconds waited on this pipeline across frames so a
     /// slow or stuck compile cannot consume every frame's wait budget.
     waited_us: AtomicU64,
+    precompiled_slot: u16,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -56,6 +57,14 @@ unsafe impl Sync for Pending {}
 
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
+        Self::new_with_slot(shaders, graphics, 0)
+    }
+
+    pub(crate) fn new_with_slot(
+        shaders: Vec<Arc<Shader>>,
+        graphics: Option<Box<GraphicsState>>,
+        precompiled_slot: u16,
+    ) -> Pending {
         let mut key = blake3::Hasher::new();
         for s in &shaders {
             key.update(s.stage.as_bytes());
@@ -72,6 +81,7 @@ impl Pending {
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
             waited_us: AtomicU64::new(0),
+            precompiled_slot,
         }
     }
 
@@ -84,6 +94,19 @@ impl Pending {
             let began = Instant::now();
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
+            if let Some(c) = super::precompiled_counters(self.precompiled_slot) {
+                if made.is_some() {
+                    let n = c[3].fetch_add(1, Ordering::Relaxed) + 1;
+                    if n <= 4 || n.is_power_of_two() {
+                        super::log_precompiled_summary(self.precompiled_slot, "host_created");
+                    }
+                } else {
+                    let n = c[4].fetch_add(1, Ordering::Relaxed) + 1;
+                    if n <= 4 || n.is_power_of_two() {
+                        super::log_precompiled_summary(self.precompiled_slot, "host_failed");
+                    }
+                }
+            }
             made
         });
     }

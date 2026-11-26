@@ -707,7 +707,7 @@ fn scc_of_and_with_exec_read_via_src_scc_matches_cpu_reference() {
         // v_cmp_eq_u32 vcc, s0, v0 (true for lane == s0)
         0x7d84_0000,
         // s_and_b64 s[16:17], vcc, exec (sets SCC = any active lane == s0)
-        0x8710_7e6a,
+        0x8790_7e6a,
         // s_add_u32 s1, 42, src_scc (s1 = SCC ? 43 : 42)
         0x8001_fdaa,
         // v_mov_b32 v5, s1
@@ -717,10 +717,9 @@ fn scc_of_and_with_exec_read_via_src_scc_matches_cpu_reference() {
         0x80 << 24 | 2 << 16 | 5 << 8,
     ];
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    lower::set_host_max_wave(32);
     let native = native_of(&words, true, 64);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let shader = lowered_counted(&native, &p, &HashSet::new(), 64, false).expect("lower");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
         v.validate(&mut copy).expect("DXIL validation failed");
