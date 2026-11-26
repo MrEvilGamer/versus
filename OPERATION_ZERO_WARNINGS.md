@@ -14,7 +14,8 @@
 4. **Cycle 1 (`3cc9155`):** `s_pack_ll_b32_b16` (`20 → 0`), `s_pack_hh_b32_b16` (`15 → 0`), `s_bfm_b64` (`4 → 0`), counter-texture `image_store` guard (`8` shaders restored: `712 → 704`).
 5. **Cycle 2 (`20318bb`):** `v_mad_u32_u16`/`v_mad_i32_i16` (`5 → 0`), `s_sext_i32_i16`/`s_sext_i32_i8` (`1 → 0`), `s_bitreplicate_b64_b32`, and 1–3 channel typed `bufferStore.f32` (`35 → 0`). **`32` more shaders fully restored (`704 → 672`), `host_created: 204 → 244` (+40)!**
 6. **Cycle 3 (`d41330e`):** Enabled `made_raw` for `tbuffer_*_format` instructions in `resource.rs` — **204 shaders advanced** past `"a descriptor changed after loading"` (`316 → 112`).
-7. **Cycle 4:** Implemented `Input::GroupInfo` (`TG_SIZE_EN` SGPR) in `lower.rs` — **`the thread-group info SGPR`: `6 → 0`**, **`4` more shaders fully restored (`672 → 668`), `host_created: 244 → 248`!**
+7. **Cycle 4 (`98e07d9`):** Implemented `Input::GroupInfo` (`TG_SIZE_EN` SGPR) in `lower.rs` — **`the thread-group info SGPR`: `6 → 0`**, **`4` more shaders fully restored (`672 → 668`), `host_created: 244 → 248`!**
+8. **Cycle 5:** Fixed `wide` dispatch for `s_bitreplicate_b64_b32` in `lower.rs` — **`s_bitreplicate_b64_b32`: `3 → 0`**, **`a select on an untracked mask`: `4 → 0`**, **`2` more shaders fully restored (`668 → 666`), `host_created: 248 → 250` (+85 total since `1dfee4a`)!**
 
 ## Remaining Top Shader Failure Categories (Baseline `ae08fb7`)
 | Unique Shaders | Category |
