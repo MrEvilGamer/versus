@@ -421,7 +421,7 @@ struct Tracer<'a> {
 type Known = Vec<(Bool, bool)>;
 
 const MAX_ROUNDS: usize = 64;
-const MAX_JOINS: usize = 8;
+const MAX_JOINS: usize = 12;
 /// VGPR values followed for one dword of a descriptor kept per lane.
 const MAX_COPIES: usize = 64;
 
