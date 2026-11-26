@@ -10127,6 +10127,33 @@ impl<'a> Lower<'a> {
                     .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, 31, &[a]);
                 self.s.m.bin(c, Bin::Add, n, b)
             }
+            "v_ldexp_f32" => {
+                // IEEE-754 ldexp(x, n) = x * 2^n, split into two factors to cover full f32 exponent range.
+                let x_bits = s(self, 0)?;
+                let x = self.s.m.cast(c, Cast::Bitcast, x_bits, self.s.t.f32);
+                let n = s(self, 1)?;
+                let lo_c = self.s.m.i32((-126i32) as u32);
+                let hi_c = self.s.m.i32(127);
+                let bias = self.s.m.i32(127);
+                let k23 = self.s.m.i32(23);
+                let one = self.s.m.i32(1);
+                let n1 = self.s.m.bin(c, Bin::AShr, n, one);
+                let n2 = self.s.m.bin(c, Bin::Sub, n, n1);
+                let scale = |this: &mut Self, e: V| -> V {
+                    let lt = this.s.m.cmp(c, pred::SLT, e, lo_c);
+                    let e = this.s.m.select(c, lt, lo_c, e);
+                    let gt = this.s.m.cmp(c, pred::SGT, e, hi_c);
+                    let e = this.s.m.select(c, gt, hi_c, e);
+                    let exp = this.s.m.bin(c, Bin::Add, e, bias);
+                    let bits = this.s.m.bin(c, Bin::Shl, exp, k23);
+                    this.s.m.cast(c, Cast::Bitcast, bits, this.s.t.f32)
+                };
+                let s1 = scale(self, n1);
+                let s2 = scale(self, n2);
+                let t = self.s.m.bin(c, Bin::Mul, x, s1);
+                let r = self.s.m.bin(c, Bin::Mul, t, s2);
+                self.s.m.cast(c, Cast::Bitcast, r, self.s.t.i32)
+            }
             "v_mad_u32_u24" | "v_mad_i32_i24" | "v_mad_u32_u16" | "v_mad_i32_i16" => {
                 let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
                 let bits = if name.ends_with("16") { 16 } else { 8 };
