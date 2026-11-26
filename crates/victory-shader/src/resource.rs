@@ -1323,12 +1323,14 @@ impl<'a> Tracer<'a> {
             Term::Value(v) => self.phis[v.0 as usize],
             Term::Const(_) => None,
         };
-        let Some((block, _)) = words.iter().find_map(phi_of) else {
+        let Some(block) = words
+            .iter()
+            .filter_map(phi_of)
+            .max_by_key(|&(b, _)| self.rpo[b])
+            .map(|(b, _)| b)
+        else {
             return Ok(None);
         };
-        if words.iter().filter_map(phi_of).any(|(b, _)| b != block) {
-            return Err("a descriptor joined in several blocks");
-        }
         if joins.contains(&block) {
             return Err("a descriptor that changes in a loop");
         }
@@ -1342,8 +1344,8 @@ impl<'a> Tracer<'a> {
             words
                 .iter()
                 .map(|w| match phi_of(w) {
-                    Some((_, i)) => self.origin(phis[i].args[j]),
-                    None => *w,
+                    Some((b, i)) if b == block => self.origin(phis[i].args[j]),
+                    _ => *w,
                 })
                 .collect()
         };
