@@ -50,17 +50,24 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
     };
     SPARES.store(keep, Ordering::Relaxed);
     let (_, finished) = crate::host::submissions();
-    let (reclaimed, stats): (Vec<ID3D12Heap>, PoolStats) = {
+    let (reclaimed, draining_count, stats): (Vec<ID3D12Heap>, usize, PoolStats) = {
         let mut pool = TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
         let reclaimed = pool.reclaim_empty(keep, finished, now());
+        let draining_count = if under_pressure {
+            pool.select_evacuation_heaps(25, 2)
+        } else {
+            pool.clear_evacuation_flags();
+            0
+        };
         let stats = pool.stats();
-        (reclaimed, stats)
+        (reclaimed, draining_count, stats)
     };
-    if !reclaimed.is_empty() {
+    if !reclaimed.is_empty() || draining_count > 0 {
         let mb = (reclaimed.len() as u64 * BLOCK) / (1024 * 1024);
         tracing::info!(
             heaps = reclaimed.len(),
             reclaimed_mb = mb,
+            draining_heaps = draining_count,
             occupied_mb = stats.occupied_bytes >> 20,
             empty_mb = stats.empty_bytes >> 20,
             deferred_mb = stats.deferred_release_bytes >> 20,
@@ -145,12 +152,27 @@ impl Ranges {
         Ranges(BTreeMap::from([(0, size)]))
     }
 
-    /// The lowest place for `len` bytes at a multiple of `align`.
+    /// Finds the tightest aligned free range for `len` bytes at a multiple of `align`.
+    /// Returns `(remaining_bytes_in_range, aligned_start)`.
+    fn best_fit_candidate(&self, len: u64, align: u64) -> Option<(u64, u64)> {
+        self.0
+            .iter()
+            .filter_map(|(&start, &size)| {
+                let at = start.next_multiple_of(align);
+                (at + len <= start + size).then(|| ((start + size) - (at + len), at))
+            })
+            .min_by_key(|&(rem, at)| (rem, at))
+    }
+
+    fn total_free(&self) -> u64 {
+        self.0.values().copied().sum()
+    }
+
+    /// Alignment-aware best-fit allocation for `len` bytes at a multiple of `align`.
     fn take(&mut self, len: u64, align: u64) -> Option<u64> {
-        let (start, size, at) = self.0.iter().find_map(|(&start, &size)| {
-            let at = start.next_multiple_of(align);
-            (at + len <= start + size).then_some((start, size, at))
-        })?;
+        let (_, target_at) = self.best_fit_candidate(len, align)?;
+        let (&start, &size) = self.0.range(..=target_at).next_back()?;
+        let at = target_at;
         self.0.remove(&start);
         if at > start {
             self.0.insert(start, at - start);
@@ -198,6 +220,8 @@ struct Block<B> {
     /// When that was (ms).
     #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     since: u64,
+    /// Marked for incremental sparse-heap evacuation: refuses new allocations.
+    draining: bool,
 }
 
 struct Pool<B> {
@@ -237,20 +261,37 @@ impl<B: Clone> Pool<B> {
             return None;
         }
         self.rested(now);
-        let mut found = None;
-        for (i, block) in self.blocks.iter_mut().enumerate() {
-            if let Some(block) = block
-                && ripe.is(block)
-                && let Some(start) = block.free.take(len, align)
-            {
-                found = Some((i, start));
-                break;
-            }
-        }
+        // Phase 1: Alignment-aware best-fit across compatible, non-draining ripe blocks.
+        // Prefer partially occupied blocks over empty blocks, and among those prefer the
+        // most-occupied block with the tightest remaining range.
+        let best_ripe = self
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, block)| {
+                let block = block.as_ref()?;
+                if block.draining || !ripe.is(block) {
+                    return None;
+                }
+                let (rem, _at) = block.free.best_fit_candidate(len, align)?;
+                let is_empty = block.free.whole(BLOCK);
+                let total_free = block.free.total_free();
+                Some(((is_empty, total_free, rem, i), i))
+            })
+            .min_by_key(|&(key, _)| key)
+            .map(|(_, i)| i);
+        let mut found = best_ripe.and_then(|i| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)));
         if found.is_none() && ripe.ahead > 0 {
-            // The one that has been there the longest.
-            let mut unripe: Vec<(u64, usize)> =
-                self.blocks.iter().enumerate().filter_map(|(i, b)| Some((b.as_ref()?.made, i))).collect();
+            // The one that has been there the longest (skipping draining blocks).
+            let mut unripe: Vec<(u64, usize)> = self
+                .blocks
+                .iter()
+                .enumerate()
+                .filter_map(|(i, b)| {
+                    let b = b.as_ref()?;
+                    (!b.draining).then_some((b.made, i))
+                })
+                .collect();
             unripe.sort_unstable();
             found = unripe.into_iter().find_map(|(_, i)| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)));
         }
@@ -291,7 +332,14 @@ impl<B: Clone> Pool<B> {
                 self.blocks.len() - 1
             }
         };
-        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
+        self.blocks[i] = Some(Block {
+            memory,
+            free: Ranges::new(BLOCK),
+            used_to: 0,
+            made,
+            since: crate::host::now_ms(),
+            draining: false,
+        });
         i
     }
 
@@ -362,6 +410,40 @@ impl<B: Clone> Pool<B> {
             empty_bytes,
             deferred_release_bytes,
             fragmented_free_bytes,
+        }
+    }
+
+    /// Marks up to `max_heaps` sparsely occupied (<= `max_occupancy_pct`%) non-empty
+    /// blocks as draining so new allocations stop landing in them.
+    fn select_evacuation_heaps(&mut self, max_occupancy_pct: u64, max_heaps: usize) -> usize {
+        let max_occupied = BLOCK.saturating_mul(max_occupancy_pct) / 100;
+        let mut candidates: Vec<(u64, usize)> = self
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| {
+                let b = b.as_ref()?;
+                if b.draining || b.free.whole(BLOCK) {
+                    return None;
+                }
+                let occupied = BLOCK.saturating_sub(b.free.total_free());
+                (occupied > 0 && occupied <= max_occupied).then_some((occupied, i))
+            })
+            .collect();
+        candidates.sort_unstable();
+        let mut marked = 0usize;
+        for (_, i) in candidates.into_iter().take(max_heaps) {
+            if let Some(b) = self.blocks[i].as_mut() {
+                b.draining = true;
+                marked += 1;
+            }
+        }
+        marked
+    }
+
+    fn clear_evacuation_flags(&mut self) {
+        for b in self.blocks.iter_mut().flatten() {
+            b.draining = false;
         }
     }
 
@@ -923,5 +1005,32 @@ mod tests {
             // SAFETY: plain query.
             assert!(host.device.GetDeviceRemovedReason().is_ok());
         }
+    }
+
+    #[test]
+    fn best_fit_avoids_empty_blocks_and_draining_blocks() {
+        let mut pool: Pool<usize> = Pool::new(8);
+        let mut next = 0usize;
+        let mut mk = || {
+            let id = next;
+            next += 1;
+            Some(id)
+        };
+        // Block 0: 48 MiB used (16 MiB free), Block 1: 32 MiB used (32 MiB free), Block 2: empty (64 MiB free).
+        let (p0a, _, _) = pool.take_ripe(24 << 20, 65536, 0, Ripe::ALL, &mut mk).unwrap();
+        let (p0b, _, _) = pool.take_ripe(24 << 20, 65536, 0, Ripe::ALL, &mut mk).unwrap();
+        assert_eq!((p0a.block, p0b.block), (0, 0));
+        let (p1, _, _) = pool.take_ripe(32 << 20, 65536, 0, Ripe::ALL, &mut mk).unwrap();
+        assert_eq!(p1.block, 1);
+        pool.add(mk().unwrap(), 0); // Block 2 is completely empty.
+
+        // A 12 MiB allocation must pack into Block 0 (most occupied that fits), NOT Block 1 or empty Block 2.
+        let (p2, _, _) = pool.take_ripe(12 << 20, 65536, 0, Ripe::ALL, &mut mk).unwrap();
+        assert_eq!(p2.block, 0);
+
+        // Mark Block 1 as draining; a 16 MiB allocation must skip draining Block 1 and use Block 2.
+        pool.blocks[1].as_mut().unwrap().draining = true;
+        let (p3, _, _) = pool.take_ripe(16 << 20, 65536, 0, Ripe::ALL, &mut mk).unwrap();
+        assert_eq!(p3.block, 2);
     }
 }
