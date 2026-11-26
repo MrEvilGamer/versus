@@ -11240,7 +11240,7 @@ impl<'a> Lower<'a> {
             // float format (the console converts by the view's format).
             // One channel goes into a view the program also counts in.
             let counter = *dmask == 1 && self.is_counter(src);
-            if *dmask == 0 || *dmask > 0xF || (self.is_counter(src) && !counter) {
+            if !matches!(*dmask, 0x1 | 0x3 | 0x7 | 0xF) || (self.is_counter(src) && !counter) {
                 return Err("an image store of some channels");
             }
             let iu = self.s.m.undef(self.s.t.i32);
@@ -11266,12 +11266,7 @@ impl<'a> Lower<'a> {
                 let mut args = vec![h];
                 args.extend(cs);
                 args.extend([x; 4]);
-                let mask = if matches!(*dmask, 0x1 | 0x3 | 0x7 | 0xF) {
-                0xF
-            } else {
-                *dmask
-            };
-            args.push(self.s.m.i8(mask));
+                args.push(self.s.m.i8(0xF));
                 let void = self.s.t.void;
                 self.s.op(
                     self.cur,
@@ -11313,12 +11308,7 @@ impl<'a> Lower<'a> {
             let mut args = vec![h];
             args.extend(cs);
             args.extend(vals);
-            let mask = if matches!(*dmask, 0x1 | 0x3 | 0x7 | 0xF) {
-                0xF
-            } else {
-                *dmask
-            };
-            args.push(self.s.m.i8(mask));
+            args.push(self.s.m.i8(0xF));
             let void = self.s.t.void;
             self.s.op(
                 self.cur,
