@@ -54,6 +54,7 @@ const NVIDIA_DEFAULTS: &[(&str, &str)] = &[
     ("VICTORY_SHOW_NEW_LATER", "1"),
     ("VICTORY_METER_THREAD", "1"),
     ("VICTORY_LANE_CORE", "1"),
+    ("VICTORY_WAIT_RESIDENT", "0"),
 ];
 
 /// Applies Versus's NVIDIA-first defaults to the process environment.
