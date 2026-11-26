@@ -1,13 +1,10 @@
-//! Live bridge wiring `versus_backend::ggvl` into `victory-gpu`'s D3D12 runtime.
-//!
-//! Tracks guest address-space registrations, CPU/GPU write events, fence
-//! completions, and DXGI `QueryVideoMemoryInfo` residency budgets.
+//! Live bridge wiring hardened `versus_backend::ggvl` (Milestone 1.1) into `victory-gpu`.
 
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use versus_backend::ggvl::{
-    ResidencyManager, ResidencyPriority, ResourceCoherencyManager, SyncAction,
+    GgvlError, QueueDeps, ResidencyManager, ResidencyPriority, ResourceCoherencyManager, SyncPlan,
 };
 
 struct GgvlState {
@@ -18,15 +15,12 @@ struct GgvlState {
 static STATE: LazyLock<Mutex<GgvlState>> = LazyLock::new(|| {
     Mutex::new(GgvlState {
         coherency: ResourceCoherencyManager::default(),
-        // Default 6 GiB until first `QueryVideoMemoryInfo` updates the live DXGI budget.
         residency: ResidencyManager::new(6 * 1024 * 1024 * 1024),
     })
 });
 
 static BUDGET_UPDATES: AtomicU64 = AtomicU64::new(0);
 static LAST_EVICT_CANDIDATES: AtomicU64 = AtomicU64::new(0);
-static LAST_BUDGET_MB: AtomicU64 = AtomicU64::new(0);
-static LAST_USAGE_MB: AtomicU64 = AtomicU64::new(0);
 
 /// Whether GGVL tracking is active (`VICTORY_GGVL=0` disables it).
 pub(crate) fn enabled() -> bool {
@@ -39,8 +33,6 @@ pub(crate) fn on_vram_budget(budget_bytes: u64, usage_bytes: u64) {
     if !enabled() {
         return;
     }
-    LAST_BUDGET_MB.store(budget_bytes / (1024 * 1024), Ordering::Relaxed);
-    LAST_USAGE_MB.store(usage_bytes / (1024 * 1024), Ordering::Relaxed);
     let n = BUDGET_UPDATES.fetch_add(1, Ordering::Relaxed);
     if let Ok(mut st) = STATE.try_lock() {
         st.residency.update_budget(budget_bytes, usage_bytes);
@@ -59,59 +51,55 @@ pub(crate) fn on_vram_budget(budget_bytes: u64, usage_bytes: u64) {
     }
 }
 
-/// Registers a guest buffer or derived texture in the GGVL address space.
 #[allow(dead_code)]
-pub(crate) fn register(guest_addr: u64, size: u64, is_derived_texture: bool, priority: ResidencyPriority) -> u64 {
+pub(crate) fn register(
+    guest_addr: u64,
+    size: u64,
+    is_derived_texture: bool,
+    priority: ResidencyPriority,
+) -> Result<u64, GgvlError> {
     if !enabled() {
-        return 0;
+        return Ok(0);
     }
     STATE
         .lock()
-        .map(|mut st| st.coherency.register(guest_addr, size, is_derived_texture, priority))
-        .unwrap_or(0)
+        .map_err(|_| GgvlError::UnknownResource(0))?
+        .coherency
+        .register(guest_addr, size, is_derived_texture, priority)
 }
 
-/// Records a CPU write range and invalidates overlapping aliases.
 #[allow(dead_code)]
-pub(crate) fn on_cpu_write(guest_addr: u64, size: u64) {
+pub(crate) fn on_cpu_write(guest_addr: u64, size: u64) -> Result<usize, GgvlError> {
     if !enabled() {
-        return;
-    }
-    if let Ok(mut st) = STATE.lock() {
-        st.coherency.on_cpu_write(guest_addr, size);
-    }
-}
-
-/// Records a GPU write associated with completion `fence`.
-#[allow(dead_code)]
-pub(crate) fn on_gpu_write(id: u64, fence: u64) {
-    if !enabled() || id == 0 {
-        return;
-    }
-    if let Ok(mut st) = STATE.lock() {
-        st.coherency.on_gpu_write(id, fence);
-    }
-}
-
-/// Plans lazy synchronization before a GPU read of `id`.
-#[allow(dead_code)]
-pub(crate) fn prepare_gpu_read(id: u64, frame: u64) -> SyncAction {
-    if !enabled() || id == 0 {
-        return SyncAction::NoOp;
+        return Ok(0);
     }
     STATE
         .lock()
-        .map(|mut st| st.coherency.prepare_gpu_read(id, frame))
-        .unwrap_or(SyncAction::NoOp)
+        .map_err(|_| GgvlError::UnknownResource(0))?
+        .coherency
+        .on_cpu_write(guest_addr, size)
 }
 
-/// Advances the completed GPU fence so deferred destructions and evictions can proceed.
 #[allow(dead_code)]
-pub(crate) fn on_fence_complete(fence: u64) {
-    if !enabled() {
-        return;
+pub(crate) fn on_gpu_write(id: u64, addr: u64, len: u64, deps: QueueDeps) -> Result<(), GgvlError> {
+    if !enabled() || id == 0 {
+        return Ok(());
     }
-    if let Ok(mut st) = STATE.try_lock() {
-        st.coherency.completed_fence = st.coherency.completed_fence.max(fence);
+    STATE
+        .lock()
+        .map_err(|_| GgvlError::UnknownResource(id))?
+        .coherency
+        .on_gpu_write(id, addr, len, deps)
+}
+
+#[allow(dead_code)]
+pub(crate) fn plan_gpu_read(id: u64, addr: u64, len: u64, frame: u64) -> Result<SyncPlan, GgvlError> {
+    if !enabled() || id == 0 {
+        return Ok(SyncPlan::NoOp);
     }
+    STATE
+        .lock()
+        .map_err(|_| GgvlError::UnknownResource(id))?
+        .coherency
+        .plan_gpu_read(id, addr, len, frame)
 }

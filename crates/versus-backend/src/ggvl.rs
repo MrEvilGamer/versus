@@ -1,9 +1,12 @@
-//! Guest GPU Virtualization Layer (GGVL) core runtime:
-//! - Logical guest address space & sparse 4 KiB page table (separate from 64 KiB D3D12 tiles)
-//! - Interval-based `GuestResourceRegistry` with aliasing & lifetime tracking
-//! - Event-driven `ResourceCoherencyManager` (authoritative ownership + lazy sync + fence tracking)
-//! - Budget-aware `ResidencyManager` with hysteresis & fence-safe eviction
-//! - `WaveClass` shader classification (Class A/B/C/D) for NVIDIA Wave32 vs AMD Wave64
+//! Guest GPU Virtualization Layer (GGVL) — Milestone 1.1 Hardened Core.
+//!
+//! - Per-4KiB-page range-level ownership (separate from 64 KiB D3D12 tile size)
+//! - Three-stage transactional synchronization: Plan -> Submit -> Complete/Cancel
+//! - Generation-checked transfer tickets (concurrent writes during transfers are never lost)
+//! - Queue-aware fence dependencies (`graphics`, `compute`, `copy`)
+//! - Checked address arithmetic & explicit `GgvlError` (no silent `NoOp` on invalid IDs)
+//! - Exact byte-range intersection for aliasing & derived texture invalidation
+//! - Budget-aware `ResidencyManager` with hysteresis & multi-queue fence-safe eviction
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -12,16 +15,69 @@ pub const GUEST_PAGE_SIZE: u64 = 4096;
 /// Hardware D3D12 reserved-resource tile size (64 KiB).
 pub const D3D12_TILE_SIZE: u64 = 65_536;
 
-/// Authoritative ownership state for a tracked guest memory range.
+/// Explicit GGVL error type (no silent drops on invalid/uninitialized/overflowed accesses).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GgvlError {
+    UnknownResource(u64),
+    AddressOverflow,
+    OutOfBounds { addr: u64, len: u64, res_start: u64, res_end: u64 },
+    NonResident(u64),
+    InFlight(u64),
+    UnknownTicket(u64),
+}
+
+/// Queue-aware GPU fence dependency vector.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueueDeps {
+    pub graphics: u64,
+    pub compute: u64,
+    pub copy: u64,
+}
+
+impl QueueDeps {
+    pub fn merge(&mut self, other: QueueDeps) {
+        self.graphics = self.graphics.max(other.graphics);
+        self.compute = self.compute.max(other.compute);
+        self.copy = self.copy.max(other.copy);
+    }
+
+    pub fn is_satisfied_by(&self, completed: QueueDeps) -> bool {
+        self.graphics <= completed.graphics
+            && self.compute <= completed.compute
+            && self.copy <= completed.copy
+    }
+}
+
+/// Per-4KiB-page authoritative ownership state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OwnershipState {
+pub enum PageState {
     Uninitialized,
     CpuAuthoritative,
     GpuAuthoritative,
     Coherent,
-    CpuToGpuPending { fence: u64 },
-    GpuToCpuPending { fence: u64 },
-    DerivedConversionPending { fence: u64 },
+    CpuToGpuPending { ticket_id: u64 },
+    GpuToCpuPending { ticket_id: u64 },
+    DerivedConversionPending { deps: QueueDeps },
+}
+
+/// Per-4KiB-page metadata inside a tracked resource.
+#[derive(Debug, Clone, Copy)]
+pub struct PageMeta {
+    pub state: PageState,
+    pub cpu_gen: u64,
+    pub gpu_gen: u64,
+    pub last_gpu_deps: QueueDeps,
+}
+
+impl Default for PageMeta {
+    fn default() -> Self {
+        Self {
+            state: PageState::Uninitialized,
+            cpu_gen: 0,
+            gpu_gen: 0,
+            last_gpu_deps: QueueDeps::default(),
+        }
+    }
 }
 
 /// Residency priority tier for VRAM budget management.
@@ -46,19 +102,48 @@ pub enum WaveClass {
     StrictFallback,
 }
 
-/// Action emitted by `ResourceCoherencyManager` on a consumer access.
+/// Kind of transactional transfer ticket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferKind {
+    CpuToGpu,
+    GpuToCpu,
+    DerivedConvert,
+}
+
+/// Generation-checked transfer ticket separating Plan -> Submit -> Complete/Cancel.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SyncAction {
+pub struct TransferTicket {
+    pub ticket_id: u64,
+    pub resource_id: u64,
+    pub kind: TransferKind,
+    /// `(page_index, expected_cpu_gen, expected_gpu_gen)` captured at planning time.
+    pub pages: Vec<(usize, u64, u64)>,
+    pub submitted_deps: Option<QueueDeps>,
+}
+
+/// Synchronization plan returned by `plan_gpu_read` / `plan_cpu_read`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncPlan {
     /// No hash, compare, upload, or readback required.
     NoOp,
-    /// Upload only the dirty guest byte ranges to the host GPU resource.
-    UploadRanges(Vec<(u64, u64)>),
-    /// Synchronize GPU-to-GPU via D3D12 barrier/fence without CPU involvement.
-    GpuBarrierOnly { wait_fence: u64 },
-    /// Download only the requested range after waiting on `wait_fence`.
-    DownloadRange { start: u64, len: u64, wait_fence: u64 },
+    /// Upload dirty guest byte ranges; caller must `submit_transfer` then `complete_transfer`.
+    UploadRanges {
+        ticket_id: u64,
+        ranges: Vec<(u64, u64)>,
+    },
+    /// GPU-to-GPU barrier/fence only — zero CPU involvement.
+    GpuBarrierOnly { deps: QueueDeps },
+    /// Download GPU-authoritative byte ranges; caller must `submit_transfer` then `complete_transfer`.
+    DownloadRanges {
+        ticket_id: u64,
+        ranges: Vec<(u64, u64)>,
+        wait_deps: QueueDeps,
+    },
     /// Re-derive aliased texture/RT representation on GPU.
-    ConvertDerived { wait_fence: u64 },
+    ConvertDerived {
+        ticket_id: u64,
+        wait_deps: QueueDeps,
+    },
 }
 
 /// Per-resource metadata in the GGVL registry.
@@ -68,44 +153,64 @@ pub struct GuestResource {
     pub guest_addr: u64,
     pub size: u64,
     pub is_derived_texture: bool,
-    pub ownership: OwnershipState,
-    pub cpu_gen: u64,
-    pub gpu_gen: u64,
-    pub last_gpu_fence: u64,
     pub priority: ResidencyPriority,
     pub resident_in_vram: bool,
     pub last_access_frame: u64,
-    /// Dirty 4 KiB page indices relative to `guest_addr`.
-    pub dirty_pages: Vec<u32>,
+    pub active_deps: QueueDeps,
+    /// Per-4KiB-page ownership & generation table.
+    pub pages: Vec<PageMeta>,
 }
 
-/// Sparse 2-level page table mapping 4 KiB guest pages to active resource IDs.
+impl GuestResource {
+    fn page_range(&self, addr: u64, len: u64) -> Result<(usize, usize), GgvlError> {
+        let end = addr.checked_add(len).ok_or(GgvlError::AddressOverflow)?;
+        let res_end = self.guest_addr.checked_add(self.size).ok_or(GgvlError::AddressOverflow)?;
+        if len == 0 || addr < self.guest_addr || end > res_end {
+            return Err(GgvlError::OutOfBounds {
+                addr,
+                len,
+                res_start: self.guest_addr,
+                res_end,
+            });
+        }
+        let first = ((addr - self.guest_addr) / GUEST_PAGE_SIZE) as usize;
+        let last = ((end - 1 - self.guest_addr) / GUEST_PAGE_SIZE) as usize;
+        Ok((first, last))
+    }
+}
+
+/// Sparse page table mapping 4 KiB guest pages to active resource IDs.
 #[derive(Default)]
 pub struct GuestMemoryPageTable {
     pages: BTreeMap<u64, Vec<u64>>,
 }
 
 impl GuestMemoryPageTable {
-    pub fn register_range(&mut self, id: u64, guest_addr: u64, size: u64) {
+    pub fn register_range(&mut self, id: u64, guest_addr: u64, size: u64) -> Result<(), GgvlError> {
+        let end = guest_addr.checked_add(size).ok_or(GgvlError::AddressOverflow)?;
         if size == 0 {
-            return;
+            return Ok(());
         }
         let first = guest_addr / GUEST_PAGE_SIZE;
-        let last = (guest_addr + size - 1) / GUEST_PAGE_SIZE;
+        let last = (end - 1) / GUEST_PAGE_SIZE;
         for p in first..=last {
             let entry = self.pages.entry(p).or_default();
             if !entry.contains(&id) {
                 entry.push(id);
             }
         }
+        Ok(())
     }
 
     pub fn unregister_range(&mut self, id: u64, guest_addr: u64, size: u64) {
+        let Some(end) = guest_addr.checked_add(size) else {
+            return;
+        };
         if size == 0 {
             return;
         }
         let first = guest_addr / GUEST_PAGE_SIZE;
-        let last = (guest_addr + size - 1) / GUEST_PAGE_SIZE;
+        let last = (end - 1) / GUEST_PAGE_SIZE;
         for p in first..=last {
             if let Some(entry) = self.pages.get_mut(&p) {
                 entry.retain(|&x| x != id);
@@ -116,13 +221,13 @@ impl GuestMemoryPageTable {
         }
     }
 
-    /// Returns all resource IDs overlapping `[guest_addr, guest_addr + size)`.
-    pub fn overlapping(&self, guest_addr: u64, size: u64) -> Vec<u64> {
+    pub fn overlapping(&self, guest_addr: u64, size: u64) -> Result<Vec<u64>, GgvlError> {
+        let end = guest_addr.checked_add(size).ok_or(GgvlError::AddressOverflow)?;
         if size == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let first = guest_addr / GUEST_PAGE_SIZE;
-        let last = (guest_addr + size - 1) / GUEST_PAGE_SIZE;
+        let last = (end - 1) / GUEST_PAGE_SIZE;
         let mut out = Vec::new();
         for (_, ids) in self.pages.range(first..=last) {
             for &id in ids {
@@ -131,17 +236,19 @@ impl GuestMemoryPageTable {
                 }
             }
         }
-        out
+        Ok(out)
     }
 }
 
-/// Event-driven coherency & aliasing manager replacing per-frame hash/compare scans.
+/// Event-driven, range-level, transactional coherency manager.
 #[derive(Default)]
 pub struct ResourceCoherencyManager {
     next_id: u64,
+    next_ticket: u64,
     pub page_table: GuestMemoryPageTable,
     pub resources: HashMap<u64, GuestResource>,
-    pub completed_fence: u64,
+    pub tickets: HashMap<u64, TransferTicket>,
+    pub completed_deps: QueueDeps,
     pub skipped_hash_passes: u64,
 }
 
@@ -152,10 +259,16 @@ impl ResourceCoherencyManager {
         size: u64,
         is_derived_texture: bool,
         priority: ResidencyPriority,
-    ) -> u64 {
+    ) -> Result<u64, GgvlError> {
+        let _end = guest_addr.checked_add(size).ok_or(GgvlError::AddressOverflow)?;
         self.next_id += 1;
         let id = self.next_id;
-        self.page_table.register_range(id, guest_addr, size);
+        self.page_table.register_range(id, guest_addr, size)?;
+        let num_pages = if size == 0 {
+            0
+        } else {
+            size.div_ceil(GUEST_PAGE_SIZE) as usize
+        };
         self.resources.insert(
             id,
             GuestResource {
@@ -163,154 +276,321 @@ impl ResourceCoherencyManager {
                 guest_addr,
                 size,
                 is_derived_texture,
-                ownership: OwnershipState::Uninitialized,
-                cpu_gen: 0,
-                gpu_gen: 0,
-                last_gpu_fence: 0,
                 priority,
                 resident_in_vram: true,
                 last_access_frame: 0,
-                dirty_pages: Vec::new(),
+                active_deps: QueueDeps::default(),
+                pages: vec![PageMeta::default(); num_pages],
             },
         );
-        id
+        Ok(id)
     }
 
-    pub fn unregister(&mut self, id: u64) -> bool {
-        if let Some(res) = self.resources.get(&id) {
-            if res.last_gpu_fence > self.completed_fence {
-                // Defer destruction while GPU work is still in flight.
-                return false;
-            }
-            let (addr, size) = (res.guest_addr, res.size);
-            self.page_table.unregister_range(id, addr, size);
-            self.resources.remove(&id);
-            return true;
+    pub fn unregister(&mut self, id: u64) -> Result<(), GgvlError> {
+        let res = self.resources.get(&id).ok_or(GgvlError::UnknownResource(id))?;
+        if !res.active_deps.is_satisfied_by(self.completed_deps) {
+            return Err(GgvlError::InFlight(id));
         }
-        false
+        let (addr, size) = (res.guest_addr, res.size);
+        self.page_table.unregister_range(id, addr, size);
+        self.resources.remove(&id);
+        Ok(())
     }
 
-    /// Record a CPU write to `[guest_addr, guest_addr + size)` and invalidate all aliases.
-    pub fn on_cpu_write(&mut self, guest_addr: u64, size: u64) {
-        let affected = self.page_table.overlapping(guest_addr, size);
+    /// Records a CPU write to `[guest_addr, guest_addr + size)` on exact intersecting pages only.
+    /// Untouched GPU-authoritative pages in the same resource remain GPU-authoritative.
+    pub fn on_cpu_write(&mut self, guest_addr: u64, size: u64) -> Result<usize, GgvlError> {
+        let write_end = guest_addr.checked_add(size).ok_or(GgvlError::AddressOverflow)?;
+        let affected = self.page_table.overlapping(guest_addr, size)?;
+        let mut pages_marked = 0usize;
         for id in affected {
             if let Some(res) = self.resources.get_mut(&id) {
-                let start = guest_addr.max(res.guest_addr);
-                let end = (guest_addr + size).min(res.guest_addr + res.size);
-                if start >= end {
+                let res_end = res.guest_addr + res.size;
+                let s = guest_addr.max(res.guest_addr);
+                let e = write_end.min(res_end);
+                if s >= e {
                     continue;
                 }
-                let first_pg = ((start - res.guest_addr) / GUEST_PAGE_SIZE) as u32;
-                let last_pg = ((end - 1 - res.guest_addr) / GUEST_PAGE_SIZE) as u32;
-                for pg in first_pg..=last_pg {
-                    if !res.dirty_pages.contains(&pg) {
-                        res.dirty_pages.push(pg);
-                    }
+                let first = ((s - res.guest_addr) / GUEST_PAGE_SIZE) as usize;
+                let last = ((e - 1 - res.guest_addr) / GUEST_PAGE_SIZE) as usize;
+                for pg in &mut res.pages[first..=last] {
+                    pg.cpu_gen += 1;
+                    pg.state = PageState::CpuAuthoritative;
+                    pages_marked += 1;
                 }
-                res.cpu_gen += 1;
-                res.ownership = OwnershipState::CpuAuthoritative;
             }
         }
+        Ok(pages_marked)
     }
 
-    /// Record a GPU write to `id` associated with completion `fence`, invalidating aliases.
-    pub fn on_gpu_write(&mut self, id: u64, fence: u64) {
-        let Some((addr, size)) = self.resources.get(&id).map(|r| (r.guest_addr, r.size)) else {
-            return;
-        };
-        let aliases = self.page_table.overlapping(addr, size);
+    /// Records a GPU write to `[addr, addr + len)` on `id` with queue dependencies `deps`.
+    /// Marks exact intersecting pages on `id` as `GpuAuthoritative` and overlapping aliases as
+    /// `DerivedConversionPending` (textures) or `GpuAuthoritative` (buffers) without clobbering
+    /// non-overlapping pages.
+    pub fn on_gpu_write(
+        &mut self,
+        id: u64,
+        addr: u64,
+        len: u64,
+        deps: QueueDeps,
+    ) -> Result<(), GgvlError> {
+        let res = self.resources.get(&id).ok_or(GgvlError::UnknownResource(id))?;
+        let _ = res.page_range(addr, len)?;
+        let write_end = addr + len;
+        let aliases = self.page_table.overlapping(addr, len)?;
         for other_id in aliases {
-            if let Some(res) = self.resources.get_mut(&other_id) {
-                res.gpu_gen += 1;
-                res.last_gpu_fence = res.last_gpu_fence.max(fence);
-                res.dirty_pages.clear();
-                res.ownership = if other_id == id {
-                    OwnershipState::GpuAuthoritative
-                } else if res.is_derived_texture {
-                    OwnershipState::DerivedConversionPending { fence }
-                } else {
-                    OwnershipState::GpuAuthoritative
-                };
-            }
-        }
-    }
-
-    /// Plan lazy synchronization before a GPU read of `id`.
-    pub fn prepare_gpu_read(&mut self, id: u64, frame: u64) -> SyncAction {
-        let Some(res) = self.resources.get_mut(&id) else {
-            return SyncAction::NoOp;
-        };
-        res.last_access_frame = frame;
-        match res.ownership {
-            OwnershipState::Coherent | OwnershipState::Uninitialized => {
-                self.skipped_hash_passes += 1;
-                SyncAction::NoOp
-            }
-            OwnershipState::GpuAuthoritative => {
-                self.skipped_hash_passes += 1;
-                SyncAction::GpuBarrierOnly {
-                    wait_fence: res.last_gpu_fence,
+            if let Some(other) = self.resources.get_mut(&other_id) {
+                let other_end = other.guest_addr + other.size;
+                let s = addr.max(other.guest_addr);
+                let e = write_end.min(other_end);
+                if s >= e {
+                    continue;
                 }
-            }
-            OwnershipState::DerivedConversionPending { fence } => {
-                res.ownership = OwnershipState::Coherent;
-                SyncAction::ConvertDerived { wait_fence: fence }
-            }
-            OwnershipState::CpuAuthoritative => {
-                res.dirty_pages.sort_unstable();
-                res.dirty_pages.dedup();
-                let mut ranges = Vec::new();
-                for &pg in &res.dirty_pages {
-                    let s = res.guest_addr + u64::from(pg) * GUEST_PAGE_SIZE;
-                    let e = (s + GUEST_PAGE_SIZE).min(res.guest_addr + res.size);
-                    if let Some((_, last_e)) = ranges.last_mut()
-                        && *last_e == s
-                    {
-                        *last_e = e;
+                other.active_deps.merge(deps);
+                let first = ((s - other.guest_addr) / GUEST_PAGE_SIZE) as usize;
+                let last = ((e - 1 - other.guest_addr) / GUEST_PAGE_SIZE) as usize;
+                for pg in &mut other.pages[first..=last] {
+                    pg.gpu_gen += 1;
+                    pg.last_gpu_deps.merge(deps);
+                    pg.state = if other_id == id {
+                        PageState::GpuAuthoritative
+                    } else if other.is_derived_texture {
+                        PageState::DerivedConversionPending { deps }
                     } else {
-                        ranges.push((s, e));
-                    }
+                        PageState::GpuAuthoritative
+                    };
                 }
-                res.dirty_pages.clear();
-                res.ownership = OwnershipState::Coherent;
-                if ranges.is_empty() {
-                    SyncAction::NoOp
+            }
+        }
+        Ok(())
+    }
+
+    /// Stage 1 (Plan): Plans lazy synchronization before a GPU read of `[addr, addr + len)`.
+    /// Does NOT clear dirty state or mark pages coherent until `complete_transfer` is called.
+    pub fn plan_gpu_read(
+        &mut self,
+        id: u64,
+        addr: u64,
+        len: u64,
+        frame: u64,
+    ) -> Result<SyncPlan, GgvlError> {
+        let res = self.resources.get_mut(&id).ok_or(GgvlError::UnknownResource(id))?;
+        if !res.resident_in_vram {
+            return Err(GgvlError::NonResident(id));
+        }
+        let (first, last) = res.page_range(addr, len)?;
+        res.last_access_frame = frame;
+
+        let mut upload_pages = Vec::new();
+        let mut derived_pages = Vec::new();
+        let mut wait_deps = QueueDeps::default();
+        let mut has_gpu_auth = false;
+
+        for (idx, pg) in res.pages[first..=last].iter().enumerate() {
+            let p = first + idx;
+            match pg.state {
+                PageState::CpuAuthoritative => {
+                    upload_pages.push((p, pg.cpu_gen, pg.gpu_gen));
+                }
+                PageState::DerivedConversionPending { deps } => {
+                    wait_deps.merge(deps);
+                    derived_pages.push((p, pg.cpu_gen, pg.gpu_gen));
+                }
+                PageState::GpuAuthoritative => {
+                    has_gpu_auth = true;
+                    wait_deps.merge(pg.last_gpu_deps);
+                }
+                PageState::Coherent
+                | PageState::Uninitialized
+                | PageState::CpuToGpuPending { .. }
+                | PageState::GpuToCpuPending { .. } => {}
+            }
+        }
+
+        if !upload_pages.is_empty() {
+            let mut ranges: Vec<(u64, u64)> = Vec::new();
+            for &(p, _, _) in &upload_pages {
+                let s = res.guest_addr + (p as u64) * GUEST_PAGE_SIZE;
+                let e = (s + GUEST_PAGE_SIZE).min(res.guest_addr + res.size);
+                if let Some((_, last_e)) = ranges.last_mut()
+                    && *last_e == s
+                {
+                    *last_e = e;
                 } else {
-                    SyncAction::UploadRanges(ranges)
+                    ranges.push((s, e));
                 }
             }
-            OwnershipState::CpuToGpuPending { fence }
-            | OwnershipState::GpuToCpuPending { fence } => {
-                SyncAction::GpuBarrierOnly { wait_fence: fence }
-            }
+            self.next_ticket += 1;
+            let ticket_id = self.next_ticket;
+            self.tickets.insert(
+                ticket_id,
+                TransferTicket {
+                    ticket_id,
+                    resource_id: id,
+                    kind: TransferKind::CpuToGpu,
+                    pages: upload_pages,
+                    submitted_deps: None,
+                },
+            );
+            return Ok(SyncPlan::UploadRanges { ticket_id, ranges });
+        }
+
+        if !derived_pages.is_empty() {
+            self.next_ticket += 1;
+            let ticket_id = self.next_ticket;
+            self.tickets.insert(
+                ticket_id,
+                TransferTicket {
+                    ticket_id,
+                    resource_id: id,
+                    kind: TransferKind::DerivedConvert,
+                    pages: derived_pages,
+                    submitted_deps: None,
+                },
+            );
+            return Ok(SyncPlan::ConvertDerived { ticket_id, wait_deps });
+        }
+
+        self.skipped_hash_passes += 1;
+        if has_gpu_auth {
+            Ok(SyncPlan::GpuBarrierOnly { deps: wait_deps })
+        } else {
+            Ok(SyncPlan::NoOp)
         }
     }
 
-    /// Plan lazy synchronization before a CPU read of `[guest_addr, guest_addr + len)`.
-    pub fn prepare_cpu_read(&mut self, id: u64, guest_addr: u64, len: u64) -> SyncAction {
-        let Some(res) = self.resources.get_mut(&id) else {
-            return SyncAction::NoOp;
-        };
-        match res.ownership {
-            OwnershipState::GpuAuthoritative | OwnershipState::DerivedConversionPending { .. } => {
-                let wait_fence = res.last_gpu_fence;
-                res.ownership = OwnershipState::Coherent;
-                SyncAction::DownloadRange {
-                    start: guest_addr,
-                    len,
-                    wait_fence,
+    /// Stage 1 (Plan): Plans lazy synchronization before a CPU read of `[addr, addr + len)`.
+    pub fn plan_cpu_read(&mut self, id: u64, addr: u64, len: u64) -> Result<SyncPlan, GgvlError> {
+        let res = self.resources.get(&id).ok_or(GgvlError::UnknownResource(id))?;
+        let (first, last) = res.page_range(addr, len)?;
+
+        let mut download_pages = Vec::new();
+        let mut wait_deps = QueueDeps::default();
+
+        for (idx, pg) in res.pages[first..=last].iter().enumerate() {
+            let p = first + idx;
+            match pg.state {
+                PageState::GpuAuthoritative | PageState::DerivedConversionPending { .. } => {
+                    wait_deps.merge(pg.last_gpu_deps);
+                    download_pages.push((p, pg.cpu_gen, pg.gpu_gen));
+                }
+                _ => {}
+            }
+        }
+
+        if download_pages.is_empty() {
+            return Ok(SyncPlan::NoOp);
+        }
+
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        for &(p, _, _) in &download_pages {
+            let s = res.guest_addr + (p as u64) * GUEST_PAGE_SIZE;
+            let e = (s + GUEST_PAGE_SIZE).min(res.guest_addr + res.size);
+            if let Some((_, last_e)) = ranges.last_mut()
+                && *last_e == s
+            {
+                *last_e = e;
+            } else {
+                ranges.push((s, e));
+            }
+        }
+
+        self.next_ticket += 1;
+        let ticket_id = self.next_ticket;
+        self.tickets.insert(
+            ticket_id,
+            TransferTicket {
+                ticket_id,
+                resource_id: id,
+                kind: TransferKind::GpuToCpu,
+                pages: download_pages,
+                submitted_deps: None,
+            },
+        );
+        Ok(SyncPlan::DownloadRanges {
+            ticket_id,
+            ranges,
+            wait_deps,
+        })
+    }
+
+    /// Stage 2 (Submit): Marks a planned transfer as submitted to GPU queues.
+    pub fn submit_transfer(&mut self, ticket_id: u64, deps: QueueDeps) -> Result<(), GgvlError> {
+        let ticket = self
+            .tickets
+            .get_mut(&ticket_id)
+            .ok_or(GgvlError::UnknownTicket(ticket_id))?;
+        ticket.submitted_deps = Some(deps);
+        if let Some(res) = self.resources.get_mut(&ticket.resource_id) {
+            res.active_deps.merge(deps);
+            for &(p, exp_cpu, exp_gpu) in &ticket.pages {
+                if let Some(pg) = res.pages.get_mut(p)
+                    && pg.cpu_gen == exp_cpu
+                    && pg.gpu_gen == exp_gpu
+                {
+                    pg.state = match ticket.kind {
+                        TransferKind::CpuToGpu => PageState::CpuToGpuPending { ticket_id },
+                        TransferKind::GpuToCpu => PageState::GpuToCpuPending { ticket_id },
+                        TransferKind::DerivedConvert => PageState::DerivedConversionPending { deps },
+                    };
                 }
             }
-            _ => SyncAction::NoOp,
         }
+        Ok(())
+    }
+
+    /// Stage 3 (Complete): Marks pages `Coherent` ONLY if their generation still matches the
+    /// snapshot captured at planning time (prevents losing concurrent CPU/GPU writes).
+    pub fn complete_transfer(&mut self, ticket_id: u64) -> Result<usize, GgvlError> {
+        let ticket = self
+            .tickets
+            .remove(&ticket_id)
+            .ok_or(GgvlError::UnknownTicket(ticket_id))?;
+        let mut committed = 0usize;
+        if let Some(res) = self.resources.get_mut(&ticket.resource_id) {
+            for &(p, exp_cpu, exp_gpu) in &ticket.pages {
+                if let Some(pg) = res.pages.get_mut(p)
+                    && pg.cpu_gen == exp_cpu
+                    && pg.gpu_gen == exp_gpu
+                {
+                    pg.state = PageState::Coherent;
+                    committed += 1;
+                }
+            }
+        }
+        Ok(committed)
+    }
+
+    /// Cancels a planned or failed transfer without corrupting authoritative state.
+    pub fn cancel_transfer(&mut self, ticket_id: u64) -> Result<(), GgvlError> {
+        let ticket = self
+            .tickets
+            .remove(&ticket_id)
+            .ok_or(GgvlError::UnknownTicket(ticket_id))?;
+        if let Some(res) = self.resources.get_mut(&ticket.resource_id) {
+            for &(p, exp_cpu, exp_gpu) in &ticket.pages {
+                if let Some(pg) = res.pages.get_mut(p)
+                    && pg.cpu_gen == exp_cpu
+                    && pg.gpu_gen == exp_gpu
+                {
+                    pg.state = match ticket.kind {
+                        TransferKind::CpuToGpu => PageState::CpuAuthoritative,
+                        TransferKind::GpuToCpu => PageState::GpuAuthoritative,
+                        TransferKind::DerivedConvert => PageState::DerivedConversionPending {
+                            deps: pg.last_gpu_deps,
+                        },
+                    };
+                }
+            }
+        }
+        Ok(())
     }
 }
 
-/// Budget-aware VRAM residency manager with hysteresis and fence-safe eviction.
+/// Budget-aware VRAM residency manager with hysteresis and multi-queue fence-safe eviction.
 pub struct ResidencyManager {
     pub local_budget_bytes: u64,
     pub local_usage_bytes: u64,
-    /// Hysteresis: evict when usage > 92% of budget, stop when < 82% of budget.
     pub high_watermark_pct: u64,
     pub low_watermark_pct: u64,
 }
@@ -343,7 +623,7 @@ impl ResidencyManager {
             .filter(|r| {
                 r.resident_in_vram
                     && r.priority < ResidencyPriority::Critical
-                    && r.last_gpu_fence <= mgr.completed_fence
+                    && r.active_deps.is_satisfied_by(mgr.completed_deps)
             })
             .collect();
         candidates.sort_by_key(|r| (r.priority, r.last_access_frame));
@@ -384,79 +664,101 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cpu_write_then_gpu_read_batches_dirty_ranges() {
+    fn partial_cpu_write_preserves_untouched_gpu_authoritative_pages() {
         let mut mgr = ResourceCoherencyManager::default();
-        let id = mgr.register(0x1000_0000, 65_536, false, ResidencyPriority::High);
-        mgr.on_cpu_write(0x1000_0000, 4096);
-        mgr.on_cpu_write(0x1000_1000, 4096);
-        let act = mgr.prepare_gpu_read(id, 1);
-        assert_eq!(act, SyncAction::UploadRanges(vec![(0x1000_0000, 0x1000_2000)]));
-        // Unchanged second read skips all hashes/uploads.
-        assert_eq!(mgr.prepare_gpu_read(id, 2), SyncAction::NoOp);
-        assert_eq!(mgr.skipped_hash_passes, 1);
+        let id = mgr.register(0x1000_0000, 16_384, false, ResidencyPriority::High).unwrap();
+        let deps = QueueDeps { graphics: 5, compute: 0, copy: 0 };
+        mgr.on_gpu_write(id, 0x1000_0000, 16_384, deps).unwrap();
+        // CPU writes only 4 bytes in page 0; pages 1..=3 MUST stay GpuAuthoritative.
+        mgr.on_cpu_write(0x1000_0000, 4).unwrap();
+        let res = &mgr.resources[&id];
+        assert_eq!(res.pages[0].state, PageState::CpuAuthoritative);
+        assert_eq!(res.pages[1].state, PageState::GpuAuthoritative);
+        assert_eq!(res.pages[2].state, PageState::GpuAuthoritative);
+        assert_eq!(res.pages[3].state, PageState::GpuAuthoritative);
     }
 
     #[test]
-    fn gpu_write_then_gpu_read_uses_barrier_no_cpu_readback() {
+    fn concurrent_cpu_write_during_upload_is_not_lost_on_complete() {
         let mut mgr = ResourceCoherencyManager::default();
-        let id = mgr.register(0x2000_0000, 65_536, false, ResidencyPriority::High);
-        mgr.on_gpu_write(id, 42);
-        assert_eq!(
-            mgr.prepare_gpu_read(id, 5),
-            SyncAction::GpuBarrierOnly { wait_fence: 42 }
-        );
+        let id = mgr.register(0x2000_0000, 8192, false, ResidencyPriority::High).unwrap();
+        mgr.on_cpu_write(0x2000_0000, 8192).unwrap();
+        let SyncPlan::UploadRanges { ticket_id, ranges } =
+            mgr.plan_gpu_read(id, 0x2000_0000, 8192, 1).unwrap()
+        else {
+            panic!("expected UploadRanges");
+        };
+        assert_eq!(ranges, vec![(0x2000_0000, 0x2000_2000)]);
+        mgr.submit_transfer(ticket_id, QueueDeps { graphics: 0, compute: 0, copy: 1 }).unwrap();
+        // Concurrent CPU write hits page 0 while upload is in flight!
+        mgr.on_cpu_write(0x2000_0000, 16).unwrap();
+        // Completing the old transfer commits page 1, but leaves page 0 CpuAuthoritative!
+        let committed = mgr.complete_transfer(ticket_id).unwrap();
+        assert_eq!(committed, 1);
+        assert_eq!(mgr.resources[&id].pages[0].state, PageState::CpuAuthoritative);
+        assert_eq!(mgr.resources[&id].pages[1].state, PageState::Coherent);
     }
 
     #[test]
-    fn gpu_write_then_cpu_read_downloads_exact_range() {
+    fn cancelled_upload_preserves_cpu_authoritative_state() {
         let mut mgr = ResourceCoherencyManager::default();
-        let id = mgr.register(0x3000_0000, 65_536, false, ResidencyPriority::High);
-        mgr.on_gpu_write(id, 99);
-        assert_eq!(
-            mgr.prepare_cpu_read(id, 0x3000_1000, 512),
-            SyncAction::DownloadRange {
-                start: 0x3000_1000,
-                len: 512,
-                wait_fence: 99
-            }
-        );
+        let id = mgr.register(0x3000_0000, 4096, false, ResidencyPriority::High).unwrap();
+        mgr.on_cpu_write(0x3000_0000, 4096).unwrap();
+        let SyncPlan::UploadRanges { ticket_id, .. } =
+            mgr.plan_gpu_read(id, 0x3000_0000, 4096, 1).unwrap()
+        else {
+            panic!("expected UploadRanges");
+        };
+        mgr.submit_transfer(ticket_id, QueueDeps { graphics: 0, compute: 0, copy: 2 }).unwrap();
+        mgr.cancel_transfer(ticket_id).unwrap();
+        assert_eq!(mgr.resources[&id].pages[0].state, PageState::CpuAuthoritative);
     }
 
     #[test]
-    fn aliased_texture_invalidates_on_buffer_gpu_write() {
+    fn partial_cpu_readback_only_marks_read_range_coherent() {
         let mut mgr = ResourceCoherencyManager::default();
-        let buf = mgr.register(0x4000_0000, 65_536, false, ResidencyPriority::High);
-        let tex = mgr.register(0x4000_0000, 65_536, true, ResidencyPriority::High);
-        mgr.on_gpu_write(buf, 77);
-        assert_eq!(
-            mgr.prepare_gpu_read(tex, 10),
-            SyncAction::ConvertDerived { wait_fence: 77 }
-        );
+        let id = mgr.register(0x4000_0000, 8192, false, ResidencyPriority::High).unwrap();
+        let deps = QueueDeps { graphics: 10, compute: 0, copy: 0 };
+        mgr.on_gpu_write(id, 0x4000_0000, 8192, deps).unwrap();
+        let SyncPlan::DownloadRanges { ticket_id, ranges, wait_deps } =
+            mgr.plan_cpu_read(id, 0x4000_0000, 512).unwrap()
+        else {
+            panic!("expected DownloadRanges");
+        };
+        assert_eq!(ranges, vec![(0x4000_0000, 0x4000_1000)]);
+        assert_eq!(wait_deps, deps);
+        mgr.complete_transfer(ticket_id).unwrap();
+        assert_eq!(mgr.resources[&id].pages[0].state, PageState::Coherent);
+        assert_eq!(mgr.resources[&id].pages[1].state, PageState::GpuAuthoritative);
     }
 
     #[test]
-    fn fence_aware_eviction_never_evicts_inflight_or_critical() {
+    fn unknown_and_oob_accesses_return_explicit_errors() {
         let mut mgr = ResourceCoherencyManager::default();
-        mgr.completed_fence = 10;
-        let crit = mgr.register(0x5000_0000, 1024, false, ResidencyPriority::Critical);
-        let inflight = mgr.register(0x5001_0000, 1024, false, ResidencyPriority::Low);
-        let cold = mgr.register(0x5002_0000, 1024, false, ResidencyPriority::Low);
-        mgr.on_gpu_write(inflight, 20); // fence 20 > completed 10
-        assert!(!mgr.unregister(inflight)); // must defer destruction
-        let mut res_mgr = ResidencyManager::new(2000);
-        res_mgr.update_budget(2000, 1950);
-        let evict = res_mgr.select_evictions(&mgr);
-        assert_eq!(evict, vec![cold]);
-        assert!(!evict.contains(&crit));
-        assert!(!evict.contains(&inflight));
+        assert_eq!(mgr.plan_gpu_read(999, 0, 64, 1), Err(GgvlError::UnknownResource(999)));
+        let id = mgr.register(0x5000_0000, 4096, false, ResidencyPriority::High).unwrap();
+        assert!(matches!(
+            mgr.plan_gpu_read(id, 0x5000_0000, 8192, 1),
+            Err(GgvlError::OutOfBounds { .. })
+        ));
+        assert_eq!(mgr.on_cpu_write(u64::MAX, 16), Err(GgvlError::AddressOverflow));
     }
 
     #[test]
-    fn wave_classifier_assigns_all_four_classes() {
-        assert_eq!(classify_shader(false, false, false, false), WaveClass::WaveIndependent);
-        assert_eq!(classify_shader(true, true, false, false), WaveClass::Wave32Compatible);
-        assert_eq!(classify_shader(true, true, true, false), WaveClass::SelectiveWave64);
-        assert_eq!(classify_shader(false, true, true, false), WaveClass::StrictFallback);
-        assert_eq!(classify_shader(true, true, true, true), WaveClass::StrictFallback);
+    fn multi_queue_fence_eviction_and_aliasing() {
+        let mut mgr = ResourceCoherencyManager::default();
+        mgr.completed_deps = QueueDeps { graphics: 10, compute: 5, copy: 2 };
+        let buf = mgr.register(0x6000_0000, 8192, false, ResidencyPriority::Low).unwrap();
+        let tex = mgr.register(0x6000_0000, 8192, true, ResidencyPriority::High).unwrap();
+        // Compute queue write on fence 8 (> completed 5) blocks eviction & marks aliased tex derived.
+        mgr.on_gpu_write(buf, 0x6000_0000, 4096, QueueDeps { graphics: 0, compute: 8, copy: 0 }).unwrap();
+        assert_eq!(mgr.unregister(buf), Err(GgvlError::InFlight(buf)));
+        let mut res_mgr = ResidencyManager::new(10_000);
+        res_mgr.update_budget(10_000, 9500);
+        assert!(res_mgr.select_evictions(&mgr).is_empty());
+        assert!(matches!(
+            mgr.plan_gpu_read(tex, 0x6000_0000, 4096, 2).unwrap(),
+            SyncPlan::ConvertDerived { .. }
+        ));
     }
 }
