@@ -42,28 +42,33 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 /// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
-    let keep = if crate::ggvl_bridge::vram_under_pressure() {
-        1
+    let under_pressure = crate::ggvl_bridge::vram_under_pressure();
+    let keep = if under_pressure {
+        0
     } else {
         spares(memory, crate::host::keep_freed())
     };
     SPARES.store(keep, Ordering::Relaxed);
-    if crate::ggvl_bridge::vram_under_pressure() {
-        let (_, finished) = crate::host::submissions();
-        let reclaimed: Vec<ID3D12Heap> = {
-            let mut pool = TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-            pool.reclaim_empty(keep, finished, now())
-        };
-        if !reclaimed.is_empty() {
-            let mb = (reclaimed.len() as u64 * BLOCK) / (1024 * 1024);
-            tracing::info!(
-                heaps = reclaimed.len(),
-                reclaimed_mb = mb,
-                "ggvl: reclaimed empty texture pool VRAM heaps under DXGI budget pressure"
-            );
-            for heap in reclaimed {
-                crate::host::retire(heap);
-            }
+    let (_, finished) = crate::host::submissions();
+    let (reclaimed, stats): (Vec<ID3D12Heap>, PoolStats) = {
+        let mut pool = TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let reclaimed = pool.reclaim_empty(keep, finished, now());
+        let stats = pool.stats();
+        (reclaimed, stats)
+    };
+    if !reclaimed.is_empty() {
+        let mb = (reclaimed.len() as u64 * BLOCK) / (1024 * 1024);
+        tracing::info!(
+            heaps = reclaimed.len(),
+            reclaimed_mb = mb,
+            occupied_mb = stats.occupied_bytes >> 20,
+            empty_mb = stats.empty_bytes >> 20,
+            deferred_mb = stats.deferred_release_bytes >> 20,
+            fragmented_mb = stats.fragmented_free_bytes >> 20,
+            "ggvl: reclaimed empty texture pool VRAM heaps via fence-safe retirement"
+        );
+        for heap in reclaimed {
+            crate::host::retire(heap);
         }
     }
 }
@@ -263,11 +268,13 @@ impl<B: Clone> Pool<B> {
                     tracing::info!("textures cut from blocks made while lists ran that still run: {n}");
                 }
             }
-            let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
-            if empty < ripe.ahead
-                && let Some(memory) = make()
-            {
-                self.add(memory, ripe.started);
+            if !crate::ggvl_bridge::vram_under_pressure() {
+                let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
+                if empty < ripe.ahead
+                    && let Some(memory) = make()
+                {
+                    self.add(memory, ripe.started);
+                }
             }
         }
         let block = self.blocks[i].as_mut()?;
@@ -315,38 +322,63 @@ impl<B: Clone> Pool<B> {
             .collect()
     }
 
-    /// Makes the pieces that rested long enough free, and lets go of empty
-    /// blocks past [`SPARE`].
+    /// Makes the pieces that rested long enough free.
+    /// Empty blocks are retired exclusively through [`reclaim_empty`] so fence checks
+    /// and accounting are centralized.
     fn rested(&mut self, now: u64) {
-        let mut any = false;
         while let Some(&(ready, piece)) = self.resting.front()
             && ready <= now
         {
             self.resting.pop_front();
             if let Some(block) = self.blocks[piece.block].as_mut() {
                 block.free.give(piece.start, piece.len);
-                any |= block.free.whole(BLOCK);
             }
         }
-        // (Without a piece given back too, once there is less room.)
-        let most = SPARES.load(Ordering::Relaxed).min(self.most);
-        if any || most < self.spare {
-            self.spare = most;
-            let mut spare = 0;
-            for block in &mut self.blocks {
-                if block.as_ref().is_some_and(|b| b.free.whole(BLOCK)) {
-                    spare += 1;
-                    if spare > most {
-                        *block = None;
-                    }
-                }
+    }
+
+    fn stats(&self) -> PoolStats {
+        let mut total_blocks = 0usize;
+        let mut empty_blocks = 0usize;
+        let mut empty_bytes = 0u64;
+        let mut fragmented_free_bytes = 0u64;
+        let mut occupied_bytes = 0u64;
+        for block in self.blocks.iter().flatten() {
+            total_blocks += 1;
+            if block.free.whole(BLOCK) {
+                empty_blocks += 1;
+                empty_bytes += BLOCK;
+            } else {
+                let free_in_block: u64 = block.free.0.values().copied().sum();
+                fragmented_free_bytes += free_in_block;
+                occupied_bytes += BLOCK.saturating_sub(free_in_block);
             }
+        }
+        let deferred_release_bytes: u64 = self.resting.iter().map(|(_, p)| p.len).sum();
+        occupied_bytes = occupied_bytes.saturating_sub(deferred_release_bytes);
+        PoolStats {
+            total_blocks,
+            empty_blocks,
+            occupied_bytes,
+            empty_bytes,
+            deferred_release_bytes,
+            fragmented_free_bytes,
         }
     }
 
     fn blocks(&self) -> usize {
         self.blocks.iter().flatten().count()
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+#[allow(dead_code)]
+pub(crate) struct PoolStats {
+    pub(crate) total_blocks: usize,
+    pub(crate) empty_blocks: usize,
+    pub(crate) occupied_bytes: u64,
+    pub(crate) empty_bytes: u64,
+    pub(crate) deferred_release_bytes: u64,
+    pub(crate) fragmented_free_bytes: u64,
 }
 
 /// A mapped upload buffer's memory.

@@ -98,3 +98,84 @@ fn multi_queue_fence_eviction_and_aliasing() {
         SyncPlan::ConvertDerived { .. }
     ));
 }
+
+#[test]
+fn unified_registry_deduplicates_backing_and_enforces_adaptive_eviction_order() {
+    let mut reg = AllocationRegistry::new();
+    let backing_shared = BackingStorageId(100);
+    // Two views sharing the same backing storage must only be counted once.
+    for id in [1, 2] {
+        reg.register(TrackedAllocation {
+            id: AllocationId(id),
+            backing_id: backing_shared,
+            kind: AllocationKind::ShadowBuffer,
+            size_bytes: 64 << 20,
+            segment: MemorySegment::LocalVram,
+            last_access_frame: 5,
+            access_frequency: 1,
+            ownership: OwnershipState::CpuAuthoritative,
+            descriptor_refs: 0,
+            generation: 1,
+            active_deps: QueueDeps { graphics: 10, compute: 0, copy: 0 },
+            restoration_cost: 20,
+            evictable: true,
+            resident: true,
+            reclaim_tier: Some(ReclaimTier::ColdShadowBuffer),
+        });
+    }
+    assert_eq!(reg.unique_backing_count(), 1);
+    assert_eq!(reg.total_unique_backing_bytes(), 64 << 20);
+
+    // Register an empty heap (tier 0) and a GPU-authoritative RT (must never be evicted).
+    reg.register(TrackedAllocation {
+        id: AllocationId(3),
+        backing_id: BackingStorageId(101),
+        kind: AllocationKind::TextureHeap,
+        size_bytes: 64 << 20,
+        segment: MemorySegment::LocalVram,
+        last_access_frame: 10,
+        access_frequency: 5,
+        ownership: OwnershipState::Coherent,
+        descriptor_refs: 0,
+        generation: 1,
+        active_deps: QueueDeps { graphics: 5, compute: 0, copy: 0 },
+        restoration_cost: 0,
+        evictable: true,
+        resident: true,
+        reclaim_tier: Some(ReclaimTier::EmptyHeap),
+    });
+    reg.register(TrackedAllocation {
+        id: AllocationId(4),
+        backing_id: BackingStorageId(102),
+        kind: AllocationKind::RenderTarget,
+        size_bytes: 32 << 20,
+        segment: MemorySegment::LocalVram,
+        last_access_frame: 1,
+        access_frequency: 1,
+        ownership: OwnershipState::GpuAuthoritative,
+        descriptor_refs: 0,
+        generation: 1,
+        active_deps: QueueDeps::default(),
+        restoration_cost: 0,
+        evictable: true,
+        resident: true,
+        reclaim_tier: Some(ReclaimTier::EmptyHeap),
+    });
+
+    let mut ctrl = AdaptiveVramController::new(1000 << 20, 50 << 20);
+    ctrl.update(1000 << 20, 920 << 20);
+    // Target = 850 MiB, effective target with 50 MiB headroom = 800 MiB -> need 120 MiB.
+    assert_eq!(ctrl.target_usage_bytes(), 850 << 20);
+    assert_eq!(ctrl.reclamation_required_bytes(), 120 << 20);
+
+    let completed = QueueDeps { graphics: 10, compute: 0, copy: 0 };
+    let evict = reg.select_adaptive_evictions(ctrl.reclamation_required_bytes(), completed);
+    // EmptyHeap (id 3) comes first, then ColdShadowBuffer (id 1), never GPU-authoritative (id 4).
+    assert_eq!(evict, vec![AllocationId(3), AllocationId(1)]);
+
+    // Submission-aware residency planner deduplicates backing IDs and respects bindless conservatism.
+    reg.get_mut(AllocationId(1)).unwrap().resident = false;
+    reg.get_mut(AllocationId(2)).unwrap().resident = false;
+    let batch = reg.plan_submission_residency(&[AllocationId(1), AllocationId(2)], false);
+    assert_eq!(batch, vec![backing_shared]);
+}

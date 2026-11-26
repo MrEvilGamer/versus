@@ -17,7 +17,11 @@ mod wave;
 
 pub use address_space::GuestMemoryPageTable;
 pub use coherency::{GuestResource, ResourceCoherencyManager};
-pub use residency::{ResidencyManager, ResidencyPriority};
+pub use residency::{
+    AdaptiveVramController, AllocationId, AllocationKind, AllocationRegistry, BackingStorageId,
+    MemorySegment, OwnershipState, ReclaimTier, ResidencyManager, ResidencyPriority,
+    TrackedAllocation,
+};
 pub use types::{D3D12_TILE_SIZE, GUEST_PAGE_SIZE, GgvlError, PageMeta, PageState, QueueDeps, SyncPlan, TransferKind, TransferTicket};
 pub use wave::{WaveClass, classify_shader};
 

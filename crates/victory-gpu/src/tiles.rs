@@ -1624,6 +1624,7 @@ void look() {
             standard: vec![HEAP_TILES + 1, 1],
             packed: 0,
             levels: 2,
+            min_level: 0,
             full: TILE,
             given: Mutex::new(Given {
                 levels: vec![false, false],
