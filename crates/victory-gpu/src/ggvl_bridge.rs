@@ -46,7 +46,7 @@ pub(crate) fn on_vram_budget(budget_bytes: u64, usage_bytes: u64) {
         return;
     }
     let n = BUDGET_UPDATES.fetch_add(1, Ordering::Relaxed);
-    if let Ok(mut st) = STATE.try_lock() {
+    if let Ok(mut st) = STATE.lock() {
         st.residency.update_budget(budget_bytes, usage_bytes);
         let evict = st.residency.select_evictions(&st.coherency);
         LAST_EVICT_CANDIDATES.store(evict.len() as u64, Ordering::Relaxed);
@@ -75,9 +75,8 @@ pub(crate) fn on_buffer_register(resource: usize, start: u64, len: u64) {
     } else {
         ResidencyPriority::Medium
     };
-    if let Ok(mut st) = STATE.try_lock()
-        && let Ok(id) = st.coherency.register(start, len, false, priority)
-    {
+    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Ok(id) = st.coherency.register(start, len, false, priority) {
         st.by_title_buf.insert((start, resource), id);
     }
 }
@@ -87,9 +86,8 @@ pub(crate) fn on_buffer_unregister(resource: usize, start: u64) {
     if !enabled() {
         return;
     }
-    if let Ok(mut st) = STATE.try_lock()
-        && let Some(id) = st.by_title_buf.remove(&(start, resource))
-    {
+    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(id) = st.by_title_buf.remove(&(start, resource)) {
         let _ = st.coherency.unregister(id);
     }
 }
@@ -104,10 +102,9 @@ pub(crate) fn on_graphics_fence_complete(completed: u64) {
     if !enabled() {
         return;
     }
-    if let Ok(mut st) = STATE.try_lock() {
-        st.coherency.completed_deps.graphics =
-            st.coherency.completed_deps.graphics.max(completed);
-    }
+    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    st.coherency.completed_deps.graphics =
+        st.coherency.completed_deps.graphics.max(completed);
 }
 
 /// Records a live CPU->GPU dirty upload range from `host.rs`.
@@ -116,9 +113,8 @@ pub(crate) fn note_cpu_upload(guest_addr: u64, len: u64) {
         return;
     }
     CPU_WRITE_EVENTS.fetch_add(1, Ordering::Relaxed);
-    if let Ok(mut st) = STATE.try_lock() {
-        let _ = st.coherency.on_cpu_write(guest_addr, len);
-    }
+    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = st.coherency.on_cpu_write(guest_addr, len);
 }
 
 /// Records a live declared UAV GPU write range from `host.rs`.
@@ -127,9 +123,8 @@ pub(crate) fn note_gpu_uav_write(guest_addr: u64, len: u64, fence: u64) {
         return;
     }
     GPU_WRITE_EVENTS.fetch_add(1, Ordering::Relaxed);
-    if let Ok(mut st) = STATE.try_lock()
-        && let Ok(ids) = st.coherency.page_table.overlapping(guest_addr, len)
-    {
+    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Ok(ids) = st.coherency.page_table.overlapping(guest_addr, len) {
         let deps = QueueDeps { graphics: fence, compute: 0, copy: 0 };
         for id in ids {
             if let Some(res) = st.coherency.resources.get(&id) {
