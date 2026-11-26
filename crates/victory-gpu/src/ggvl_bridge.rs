@@ -1,26 +1,113 @@
 //! Live bridge wiring hardened `versus_backend::ggvl` (Milestone 1.1) into `victory-gpu`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use versus_backend::ggvl::{
-    GgvlError, QueueDeps, ResidencyManager, ResidencyPriority, ResourceCoherencyManager, SyncPlan,
+    GgvlError, PageState, QueueDeps, ResidencyManager, ResidencyPriority, ResourceCoherencyManager, SyncPlan,
 };
 
 struct GgvlState {
     coherency: ResourceCoherencyManager,
     residency: ResidencyManager,
     by_title_buf: HashMap<(u64, usize), u64>,
+    pending_unregister: HashSet<u64>,
 }
 
-static STATE: LazyLock<Mutex<GgvlState>> = LazyLock::new(|| {
-    Mutex::new(GgvlState {
-        coherency: ResourceCoherencyManager::default(),
-        residency: ResidencyManager::new(6 * 1024 * 1024 * 1024),
-        by_title_buf: HashMap::new(),
-    })
-});
+impl GgvlState {
+    fn new() -> Self {
+        Self {
+            coherency: ResourceCoherencyManager::default(),
+            residency: ResidencyManager::new(6 * 1024 * 1024 * 1024),
+            by_title_buf: HashMap::new(),
+            pending_unregister: HashSet::new(),
+        }
+    }
+
+    fn retire_registration(&mut self, id: u64) {
+        match self.coherency.unregister(id) {
+            Ok(()) | Err(GgvlError::UnknownResource(_)) => {
+                self.pending_unregister.remove(&id);
+            }
+            Err(_) => {
+                self.pending_unregister.insert(id);
+            }
+        }
+    }
+
+    fn register_buffer(&mut self, key: (u64, usize), len: u64, priority: ResidencyPriority) {
+        // A reused title object/address must not orphan its previous ID.
+        if let Some(old) = self.by_title_buf.remove(&key) {
+            self.retire_registration(old);
+        }
+        if let Ok(id) = self.coherency.register(key.0, len, false, priority) {
+            self.by_title_buf.insert(key, id);
+        }
+    }
+
+    fn unregister_buffer(&mut self, key: (u64, usize)) {
+        if let Some(id) = self.by_title_buf.remove(&key) {
+            self.retire_registration(id);
+        }
+    }
+
+    fn complete_graphics(&mut self, completed: u64) {
+        self.coherency.completed_deps.graphics =
+            self.coherency.completed_deps.graphics.max(completed);
+        let coherency = &mut self.coherency;
+        self.pending_unregister.retain(|id| {
+            !matches!(coherency.unregister(*id), Ok(()) | Err(GgvlError::UnknownResource(_)))
+        });
+    }
+
+    // This is deliberately conservative: page-index hits are candidates,
+    // not proof of exact byte coverage or of ownership. Only a live
+    // containing registration, with no observed GPU-write history in any
+    // overlapping alias, is eligible for the experimental shortcut.
+    // For destruction also require a single exact registration.
+    fn known_readonly_range(&self, addr: u64, len: u64, exact_single: bool) -> bool {
+        let Some(end) = addr.checked_add(len) else { return false; };
+        if len == 0 { return false; }
+        let Ok(ids) = self.coherency.page_table.overlapping(addr, len) else { return false; };
+        let mut contains = false;
+        let mut overlapping = 0usize;
+        for id in ids {
+            let Some(res) = self.coherency.resources.get(&id) else { return false; };
+            let Some(res_end) = res.guest_addr.checked_add(res.size) else { return false; };
+            if addr >= res_end || end <= res.guest_addr { continue; }
+            overlapping += 1;
+            if self.pending_unregister.contains(&id)
+                || !res.resident_in_vram
+                || res.is_derived_texture
+                || res.active_deps != QueueDeps::default()
+                || self.coherency.tickets.values().any(|ticket| ticket.resource_id == id)
+            {
+                return false;
+            }
+            let first = ((addr.max(res.guest_addr) - res.guest_addr)
+                / versus_backend::ggvl::GUEST_PAGE_SIZE) as usize;
+            let last = ((end.min(res_end) - 1 - res.guest_addr)
+                / versus_backend::ggvl::GUEST_PAGE_SIZE) as usize;
+            let Some(pages) = res.pages.get(first..=last) else { return false; };
+            if pages.iter().any(|p| p.gpu_gen != 0 || p.last_gpu_deps != QueueDeps::default()
+                || (exact_single && !matches!(p.state, PageState::CpuAuthoritative | PageState::Coherent))
+                || matches!(p.state, PageState::GpuAuthoritative | PageState::DerivedConversionPending { .. }
+                    | PageState::CpuToGpuPending { .. } | PageState::GpuToCpuPending { .. }))
+            {
+                return false;
+            }
+            contains |= if exact_single {
+                res.guest_addr == addr && res_end == end
+            } else {
+                res.guest_addr <= addr && res_end >= end
+            };
+        }
+        contains && (!exact_single || overlapping == 1)
+    }
+}
+
+static STATE: LazyLock<Mutex<GgvlState>> = LazyLock::new(|| Mutex::new(GgvlState::new()));
 
 static BUDGET_UPDATES: AtomicU64 = AtomicU64::new(0);
 static VRAM_PRESSURE: AtomicBool = AtomicBool::new(false);
@@ -104,9 +191,7 @@ pub(crate) fn on_buffer_register(resource: usize, start: u64, len: u64) {
         ResidencyPriority::Medium
     };
     let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Ok(id) = st.coherency.register(start, len, false, priority) {
-        st.by_title_buf.insert((start, resource), id);
-    }
+    st.register_buffer((start, resource), len, priority);
 }
 
 /// Unregisters a title buffer from `shadow::unregister` (defers if GPU work is in flight).
@@ -115,9 +200,7 @@ pub(crate) fn on_buffer_unregister(resource: usize, start: u64) {
         return;
     }
     let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(id) = st.by_title_buf.remove(&(start, resource)) {
-        let _ = st.coherency.unregister(id);
-    }
+    st.unregister_buffer((start, resource));
 }
 
 /// Enters pressure above the high watermark (92%), exits at or below the low
@@ -132,26 +215,18 @@ pub(crate) fn on_graphics_fence_complete(completed: u64) {
         return;
     }
     let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    st.coherency.completed_deps.graphics =
-        st.coherency.completed_deps.graphics.max(completed);
+    st.complete_graphics(completed);
 }
 
-/// Returns true if all GGVL queue fence dependencies on `guest_addr..guest_addr+len`
-/// are satisfied by `completed_deps`, meaning eviction is fence-safe.
+/// Conservative eligibility for destroying a regenerable shadow. A missing
+/// registration or an alias with unknown provenance is not proof of safety.
+/// The caller must also establish host resource lifetime and descriptor safety.
 pub(crate) fn is_fence_safe(guest_addr: u64, len: u64) -> bool {
     if !enabled() || len == 0 {
-        return true;
+        return false;
     }
     let st = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    let Ok(ids) = st.coherency.page_table.overlapping(guest_addr, len) else {
-        return false;
-    };
-    ids.iter().all(|id| {
-        st.coherency
-            .resources
-            .get(id)
-            .is_none_or(|r| r.active_deps.is_satisfied_by(st.coherency.completed_deps))
-    })
+    st.known_readonly_range(guest_addr, len, true)
 }
 
 /// Records an actual VRAM eviction of a cold buffer (marks nonresident until restored).
@@ -161,7 +236,9 @@ pub(crate) fn note_evicted(guest_addr: u64, len: u64) {
     let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
     if let Ok(ids) = st.coherency.page_table.overlapping(guest_addr, len) {
         for id in ids {
-            if let Some(res) = st.coherency.resources.get_mut(&id) {
+            if let Some(res) = st.coherency.resources.get_mut(&id)
+                && res.guest_addr == guest_addr && res.size == len
+            {
                 res.resident_in_vram = false;
             }
         }
@@ -190,40 +267,21 @@ pub(crate) fn note_gpu_uav_write(guest_addr: u64, len: u64, fence: u64) {
     }
     GPU_WRITE_EVENTS.fetch_add(1, Ordering::Relaxed);
     let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Ok(ids) = st.coherency.page_table.overlapping(guest_addr, len) {
-        let deps = QueueDeps { graphics: fence, compute: 0, copy: 0 };
-        for id in ids {
-            if let Some(res) = st.coherency.resources.get(&id) {
-                let s = guest_addr.max(res.guest_addr);
-                let e = guest_addr.saturating_add(len).min(res.guest_addr + res.size);
-                if s < e {
-                    let _ = st.coherency.on_gpu_write(id, s, e - s, deps);
-                }
-            }
-        }
-    }
+    let deps = QueueDeps { graphics: fence, compute: 0, copy: 0 };
+    let _ = st.coherency.on_gpu_buffer_write(guest_addr, len, deps);
 }
 
-/// Returns true if `guest_addr..guest_addr+len` has never been GPU-written and
+/// Returns true for a fully covered range with no observed GPU-write history, and
 /// `VICTORY_GGVL_SKIP_READONLY_HASH=1` is enabled.
 pub(crate) fn may_skip_rehash(guest_addr: u64, len: u64) -> bool {
     if !enabled() || !skip_readonly_hash() || len == 0 {
         return false;
     }
     if let Ok(st) = STATE.try_lock()
-        && let Ok(ids) = st.coherency.page_table.overlapping(guest_addr, len)
-        && !ids.is_empty()
+        && st.known_readonly_range(guest_addr, len, false)
     {
-        let any_gpu_written = ids.iter().any(|id| {
-            st.coherency
-                .resources
-                .get(id)
-                .is_some_and(|r| r.active_deps.graphics > 0 || r.active_deps.compute > 0)
-        });
-        if !any_gpu_written {
-            READONLY_HASH_SKIPS.fetch_add(1, Ordering::Relaxed);
-            return true;
-        }
+        READONLY_HASH_SKIPS.fetch_add(1, Ordering::Relaxed);
+        return true;
     }
     false
 }
@@ -302,5 +360,67 @@ mod pressure_tests {
         assert!(pressure_after_sample(true, 0, 0, 92, 82));
         assert!(!pressure_after_sample(false, 0, u64::MAX, 92, 82));
         assert!(pressure_after_sample(false, u64::MAX, u64::MAX, 92, 82));
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn unregister_retries_after_submission_finishes() {
+        let mut st = GgvlState::new();
+        let key = (0x1000, 1);
+        st.register_buffer(key, 4096, ResidencyPriority::High);
+        let id = st.by_title_buf[&key];
+        st.coherency.on_gpu_write(id, key.0, 4096, QueueDeps { graphics: 5, ..Default::default() }).unwrap();
+        st.unregister_buffer(key);
+        assert!(!st.by_title_buf.contains_key(&key));
+        assert!(st.pending_unregister.contains(&id));
+        st.complete_graphics(4);
+        assert!(st.coherency.resources.contains_key(&id));
+        st.complete_graphics(5);
+        assert!(!st.coherency.resources.contains_key(&id));
+        assert!(st.pending_unregister.is_empty());
+        assert!(st.coherency.page_table.overlapping(key.0, 4096).unwrap().is_empty());
+    }
+
+    #[test]
+    fn replaced_registration_does_not_orphan_previous_id() {
+        let mut st = GgvlState::new();
+        let key = (0x2000, 2);
+        st.register_buffer(key, 4096, ResidencyPriority::High);
+        let first = st.by_title_buf[&key];
+        st.coherency.on_gpu_write(first, key.0, 4096, QueueDeps { graphics: 3, ..Default::default() }).unwrap();
+        st.register_buffer(key, 4096, ResidencyPriority::High);
+        let second = st.by_title_buf[&key];
+        assert_ne!(first, second);
+        assert!(st.pending_unregister.contains(&first));
+        assert!(!st.known_readonly_range(key.0, 4096, false));
+        st.complete_graphics(3);
+        assert!(!st.coherency.resources.contains_key(&first));
+        assert_eq!(st.by_title_buf[&key], second);
+        assert!(st.coherency.resources.contains_key(&second));
+    }
+
+    #[test]
+    fn range_guards_require_coverage_and_ignore_unrelated_page_hits() {
+        let mut st = GgvlState::new();
+        st.register_buffer((0x1000, 1), 16, ResidencyPriority::High);
+        st.register_buffer((0x1800, 2), 16, ResidencyPriority::High);
+        assert!(!st.known_readonly_range(0x1000, 32, false));
+        assert!(!st.known_readonly_range(0x1100, 1, false));
+        assert!(!st.known_readonly_range(u64::MAX, 1, false));
+        assert!(st.known_readonly_range(0x1000, 16, false));
+        assert!(!st.known_readonly_range(0x1000, 16, true));
+        st.coherency.on_cpu_write(0x1000, 16).unwrap();
+        assert!(st.known_readonly_range(0x1000, 16, true));
+        st.coherency.on_gpu_buffer_write(0x1800, 16, QueueDeps { copy: 1, ..Default::default() }).unwrap();
+        assert!(st.known_readonly_range(0x1000, 16, false));
+        assert!(!st.known_readonly_range(0x1800, 16, false));
+        st.register_buffer((0x1008, 3), 8, ResidencyPriority::High);
+        assert!(!st.known_readonly_range(0x1000, 16, true));
+        st.coherency.on_gpu_buffer_write(0x1008, 1, QueueDeps::default()).unwrap();
+        assert!(!st.known_readonly_range(0x1000, 16, false));
     }
 }
