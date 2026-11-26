@@ -997,13 +997,24 @@ impl<'a> Tracer<'a> {
         })
     }
 
-    /// `hi` is `high` (0 for a table), possibly plus a carry.
+    /// `hi` is `high` (0 for a table), possibly plus a carry (`s_addc_u32` or `s_add_u32` with `src_scc`).
     fn high_half(&self, hi: Term, high: Option<Value>) -> bool {
         let want = high.map_or(Term::Const(0), Term::Value);
+        let add_scc = |v: Value| {
+            self.def(v).is_some_and(|i| {
+                i.name() == "s_add_u32"
+                    && matches!(
+                        &i.fields,
+                        Fields::Sop { src, .. }
+                            if matches!(src.as_slice(), [a, Operand::Const(253)] if self.term(i, a) == Some(want))
+                                || matches!(src.as_slice(), [Operand::Const(253), a] if self.term(i, a) == Some(want))
+                    )
+            })
+        };
         hi == want
             || matches!(hi, Term::Value(v) if self.sop2(v, &["s_addc_u32"]).is_some_and(
                 |(_, [a, b])| a == want && b == Term::Const(0) || b == want && a == Term::Const(0)
-            ))
+            ) || add_scc(v))
     }
 
     /// `hi` adds something (with carry) to `high`: `s_addc_u32` or

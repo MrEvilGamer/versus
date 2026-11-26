@@ -25,7 +25,8 @@
 15. **Cycle 13 (`9ef0da5`):** Added `VICTORY_DUMP_1C8` capture hook and `tools/dump_1c8.py`, decoding `0x1C8` `pmeta` (input layout), `vs_meta`/`ps_meta` (`0x10` header + `0x41`/`0x42`/`0x43` `FSPX` records), and `gstate` (RDNA2 registers).
 16. **Cycle 14 (`8d79b83`):** Implemented IEEE-754 `v_ldexp_f32` in `lower.rs` — **`v_ldexp_f32`: `2 → 0`**, **Total `WARN`: `633` (`29` categories), `host_created: 304`, `0` errors!**
 17. **Cycle 15 (`f91de1e`):** Implemented DPP source modifier support for `v_cmp_*`/`v_cmpx_*` in `lower.rs` — **`a compare with DPP`: `1 → 0`**, **Total `WARN`: `631` (`28` categories), `host_created: 305`, `0` errors!**
-18. **Cycle 16:** Added trailing SM 6.6 `ResourceHeap`/`SamplerHeap` user SGPRs (`COMPUTE_PGM_RSRC2.USER_SGPR`) to `fspx_program()` in `native.rs` — **`a descriptor outside the heaps`: `219 → 10` (`-209`)**, **`104` shaders fully restored (`609 → 505`), `host_created: 305 → 375` (`+70`, `+210` total since `1dfee4a`), `executed: 4 → 7`, Total `WARN`: `631 → 530` (`-101`)!**
+18. **Cycle 16 (`264d134`):** Added trailing SM 6.6 `ResourceHeap`/`SamplerHeap` user SGPRs (`COMPUTE_PGM_RSRC2.USER_SGPR`) to `fspx_program()` in `native.rs` — **`a descriptor outside the heaps`: `219 → 10` (`-209`)**, **`104` shaders fully restored (`609 → 505`), `host_created: 305 → 375` (`+70`), `executed: 4 → 7`!**
+19. **Cycle 17:** Added `s_add_u32(..., src_scc)` carry recognition to `high_half()` in `resource.rs` — **`an address with an untracked high half`: `148 → 2` (`-146`)**, **`host_created: 375 → 385` (`+220` total since `1dfee4a`), Total `WARN`: `545` (`-61%` from `1,392` baseline)!**
 
 ## Remaining Top Shader Failure Categories (Baseline `ae08fb7`)
 | Unique Shaders | Category |
