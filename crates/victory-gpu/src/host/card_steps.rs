@@ -933,35 +933,86 @@ const POOLED: usize = 32;
 /// made and let go (for the frame line: what the pool holds).
 static MADE: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
-/// Back into the pool once landed; bounded by both entry count (`POOLED`) and
-/// total device-local VRAM bytes (128 MiB normally, 32 MiB under DXGI pressure).
-fn pool(own: Own) {
-    const POOLED_MAX_BYTES: u64 = 128 << 20;
-    const POOLED_PRESSURE_BYTES: u64 = 32 << 20;
+const POOLED_MAX_BYTES: u64 = 128 << 20;
+const POOLED_PRESSURE_BYTES: u64 = 32 << 20;
+
+fn trim_pool_entries<T>(
+    pool: &mut Vec<T>,
+    size_of: impl Fn(&T) -> u64,
+    max_count: usize,
+    max_bytes: u64,
+) -> Vec<T> {
+    let mut dropped = Vec::new();
+    let mut total: u64 = pool.iter().map(&size_of).sum();
+    while pool.len() > max_count || total > max_bytes {
+        let idx = if total > max_bytes {
+            pool.iter().enumerate().max_by_key(|(_, o)| size_of(o)).map(|(i, _)| i)
+        } else {
+            pool.iter().enumerate().min_by_key(|(_, o)| size_of(o)).map(|(i, _)| i)
+        };
+        let Some(i) = idx else { break };
+        let gone = pool.swap_remove(i);
+        total = total.saturating_sub(size_of(&gone));
+        dropped.push(gone);
+    }
+    dropped
+}
+
+/// Proactively trims idle forwarding buffers under DXGI VRAM pressure,
+/// independent of buffer return cadence.
+pub(crate) fn trim_pool_under_pressure() {
     let byte_cap = if crate::ggvl_bridge::vram_under_pressure() {
         POOLED_PRESSURE_BYTES
     } else {
         POOLED_MAX_BYTES
     };
-    let mut dropped = Vec::new();
-    {
+    let dropped = {
         let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-        pool.push(own);
-        let mut total: u64 = pool.iter().map(|o| o.size).sum();
-        while pool.len() > POOLED || (pool.len() > 1 && total > byte_cap) {
-            let idx = if total > byte_cap {
-                pool.iter().enumerate().max_by_key(|(_, o)| o.size).map(|(i, _)| i)
-            } else {
-                pool.iter().enumerate().min_by_key(|(_, o)| o.size).map(|(i, _)| i)
-            };
-            let Some(i) = idx else { break };
-            let gone = pool.swap_remove(i);
-            total = total.saturating_sub(gone.size);
-            dropped.push(gone);
-        }
-    }
+        trim_pool_entries(&mut pool, |o| o.size, POOLED, byte_cap)
+    };
     for gone in dropped {
         MADE[2].fetch_add(gone.size, Ordering::Relaxed);
+    }
+}
+
+/// Back into the pool once landed; strictly bounded by both entry count (`POOLED`)
+/// and total device-local VRAM bytes (128 MiB normally, 32 MiB under DXGI pressure).
+fn pool(own: Own) {
+    let byte_cap = if crate::ggvl_bridge::vram_under_pressure() {
+        POOLED_PRESSURE_BYTES
+    } else {
+        POOLED_MAX_BYTES
+    };
+    let dropped = {
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        pool.push(own);
+        trim_pool_entries(&mut pool, |o| o.size, POOLED, byte_cap)
+    };
+    for gone in dropped {
+        MADE[2].fetch_add(gone.size, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod pool_cap_tests {
+    use super::*;
+
+    #[test]
+    fn strict_cap_evicts_oversized_single_entry_and_handles_pressure_transition() {
+        let mut entries = vec![200u64 << 20];
+        let dropped = trim_pool_entries(&mut entries, |&s| s, POOLED, POOLED_MAX_BYTES);
+        assert!(entries.is_empty(), "single oversized entry must not bypass byte cap");
+        assert_eq!(dropped, vec![200u64 << 20]);
+
+        let mut entries = vec![16 << 20, 32 << 20, 48 << 20, 24 << 20]; // 120 MiB <= 128 MiB
+        assert!(trim_pool_entries(&mut entries, |&s| s, POOLED, POOLED_MAX_BYTES).is_empty());
+
+        // Transition to DXGI pressure (32 MiB cap): largest entries evicted first.
+        let dropped = trim_pool_entries(&mut entries, |&s| s, POOLED, POOLED_PRESSURE_BYTES);
+        let remaining: u64 = entries.iter().sum();
+        assert!(remaining <= POOLED_PRESSURE_BYTES);
+        assert_eq!(remaining, 16 << 20);
+        assert_eq!(dropped.len(), 3);
     }
 }
 

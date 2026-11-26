@@ -3766,7 +3766,7 @@ pub(crate) mod aside;
 pub(crate) mod awake;
 mod memory_policy;
 pub(crate) use memory_policy::{RamBand, available_physical_ram, keep_freed, ram_band, ram_idle_ms, ram_sample};
-mod card_steps;
+pub(crate) mod card_steps;
 pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 mod panel;

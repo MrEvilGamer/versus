@@ -49,6 +49,9 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         spares(memory, crate::host::keep_freed())
     };
     SPARES.store(keep, Ordering::Relaxed);
+    if under_pressure {
+        crate::host::card_steps::trim_pool_under_pressure();
+    }
     let (_, finished) = crate::host::submissions();
     let (reclaimed, draining_count, stats): (Vec<(ID3D12Heap, u64)>, usize, PoolStats) = {
         let mut pool = TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
