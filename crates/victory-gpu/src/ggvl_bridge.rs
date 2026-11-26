@@ -1,5 +1,6 @@
 //! Live bridge wiring hardened `versus_backend::ggvl` (Milestone 1.1) into `victory-gpu`.
 
+use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -10,12 +11,14 @@ use versus_backend::ggvl::{
 struct GgvlState {
     coherency: ResourceCoherencyManager,
     residency: ResidencyManager,
+    by_title_buf: HashMap<(u64, usize), u64>,
 }
 
 static STATE: LazyLock<Mutex<GgvlState>> = LazyLock::new(|| {
     Mutex::new(GgvlState {
         coherency: ResourceCoherencyManager::default(),
         residency: ResidencyManager::new(6 * 1024 * 1024 * 1024),
+        by_title_buf: HashMap::new(),
     })
 });
 
@@ -48,6 +51,35 @@ pub(crate) fn on_vram_budget(budget_bytes: u64, usage_bytes: u64) {
                 "ggvl: live residency & coherency status"
             );
         }
+    }
+}
+
+/// Registers a title buffer from `shadow::register` into the live GGVL address space.
+pub(crate) fn on_buffer_register(resource: usize, start: u64, len: u64) {
+    if !enabled() || len == 0 {
+        return;
+    }
+    let priority = if len >= (1 << 20) {
+        ResidencyPriority::High
+    } else {
+        ResidencyPriority::Medium
+    };
+    if let Ok(mut st) = STATE.try_lock()
+        && let Ok(id) = st.coherency.register(start, len, false, priority)
+    {
+        st.by_title_buf.insert((start, resource), id);
+    }
+}
+
+/// Unregisters a title buffer from `shadow::unregister` (defers if GPU work is in flight).
+pub(crate) fn on_buffer_unregister(resource: usize, start: u64) {
+    if !enabled() {
+        return;
+    }
+    if let Ok(mut st) = STATE.try_lock()
+        && let Some(id) = st.by_title_buf.remove(&(start, resource))
+    {
+        let _ = st.coherency.unregister(id);
     }
 }
 

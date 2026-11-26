@@ -5016,11 +5016,13 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
             shadow: None,
         },
     );
+    crate::ggvl_bridge::on_buffer_register(resource, start, len);
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
     buffers().remove(&(start, resource));
+    crate::ggvl_bridge::on_buffer_unregister(resource, start);
 }
 
 /// The title buffer holding `address`, as (start, length), without making
