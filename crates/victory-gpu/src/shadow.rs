@@ -1651,6 +1651,15 @@ static SNAPS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
 /// With [`wide_back`], when a submission's refreshes are done and before
 /// its lists go to the card: takes the snapshots [`Shadow::writing`] noted.
 /// Nothing to do without the switch.
+/// Snapshot telemetry: `[0] = requested_bytes, [1] = reused_bytes, [2] = copied_bytes, [3] = copy_ns`.
+static SNAP_TELEMETRY: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static SNAP_BATCHES: AtomicU64 = AtomicU64::new(0);
+
 pub(crate) fn take_snapshots() {
     let snaps = std::mem::take(&mut *SNAPS.lock().unwrap_or_else(|e| e.into_inner()));
     if snaps.is_empty() {
@@ -1660,6 +1669,7 @@ pub(crate) fn take_snapshots() {
     if total_bytes == 0 {
         return;
     }
+    let started = std::time::Instant::now();
     let threads = wide_threads() + 1;
     // Adaptive chunk size: target ~4 chunks per worker thread, clamped to [64 KiB, 1 MiB].
     let chunk_size = (total_bytes / (threads * 4)).clamp(64 << 10, WIDE_JOB);
@@ -1678,14 +1688,35 @@ pub(crate) fn take_snapshots() {
             // SAFETY: caller's non-overlapping host copy mapping and snapshot buffer.
             unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
         }
-        return;
+    } else {
+        let flat = Arc::new(flat);
+        wide_each(count, move |i| {
+            let (src, dst, len) = flat[i];
+            // SAFETY: caller's non-overlapping host copy mapping and snapshot buffer.
+            unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+        });
     }
-    let flat = Arc::new(flat);
-    wide_each(count, move |i| {
-        let (src, dst, len) = flat[i];
-        // SAFETY: caller's non-overlapping host copy mapping and snapshot buffer.
-        unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
-    });
+    let ns = started.elapsed().as_nanos() as u64;
+    SNAP_TELEMETRY[0].fetch_add(total_bytes as u64, Ordering::Relaxed);
+    SNAP_TELEMETRY[2].fetch_add(total_bytes as u64, Ordering::Relaxed);
+    SNAP_TELEMETRY[3].fetch_add(ns, Ordering::Relaxed);
+    let n = SNAP_BATCHES.fetch_add(1, Ordering::Relaxed) + 1;
+    if n % 120 == 0 {
+        let req = SNAP_TELEMETRY[0].swap(0, Ordering::Relaxed);
+        let reused = SNAP_TELEMETRY[1].swap(0, Ordering::Relaxed);
+        let copied = SNAP_TELEMETRY[2].swap(0, Ordering::Relaxed);
+        let copy_ns = SNAP_TELEMETRY[3].swap(0, Ordering::Relaxed).max(1);
+        let gb_s = (copied as f64) / (copy_ns as f64);
+        tracing::info!(
+            batches = 120,
+            requested_mb = req >> 20,
+            reused_mb = reused >> 20,
+            copied_mb = copied >> 20,
+            avg_copy_ms = (copy_ns as f64 / 1e6) / 120.0,
+            bandwidth_gbs = format!("{gb_s:.2}"),
+            "shadow: snapshot pipeline telemetry"
+        );
+    }
 }
 
 /// `copies` (from, to, bytes) as pieces of work of about [`WIDE_JOB`]

@@ -8153,6 +8153,44 @@ impl Batch {
                 return;
             }
         }
+        if light && self.refreshes.len() > FEW {
+            // Phase 3: Parallel clean-range validation with compact dirty-mask output BEFORE
+            // `ask_ahead()` so clean entries never enter write-watch asking or refresh workers.
+            let started = std::time::Instant::now();
+            let all = self.refreshes.len();
+            let refs = std::sync::Arc::new(std::mem::take(&mut self.refreshes));
+            let dirty = std::sync::Arc::new(
+                (0..all).map(|_| std::sync::atomic::AtomicU8::new(0)).collect::<Vec<_>>(),
+            );
+            let (refs_c, dirty_c) = (refs.clone(), dirty.clone());
+            crate::shadow::wide_each(all, move |i| {
+                let (shadow, from, to) = &refs_c[i];
+                if !shadow.nothing_new(*from, *to - *from) {
+                    dirty_c[i].store(1, Ordering::Relaxed);
+                }
+            });
+            let mut kept_dirty = Vec::new();
+            let mut clean_count = 0u64;
+            for (i, (shadow, from, to)) in refs.iter().enumerate() {
+                if dirty[i].load(Ordering::Relaxed) != 0 {
+                    kept_dirty.push((shadow.clone(), *from, *to));
+                } else {
+                    clean_count += 1;
+                    let key = std::ptr::from_ref(shadow.as_ref()) as usize;
+                    let entry = self.clean_cache.entry(key).or_default();
+                    if !entry.iter().any(|&(a, b)| a <= *from && *to <= b) {
+                        entry.push((*from, *to));
+                    }
+                }
+            }
+            self.refreshes = kept_dirty;
+            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            FLUSHES[2].fetch_add(clean_count, Ordering::Relaxed);
+            if self.refreshes.is_empty() {
+                return;
+            }
+        }
         // Any remaining refresh may write or copy-back; invalidate clean cache conservatively.
         if !self.refreshes.is_empty() {
             self.clean_cache.clear();
