@@ -76,3 +76,6 @@
 *.swp
 Thumbs.db
 .DS_Store
+
+bench-logs/
+bench.ps1
