@@ -183,16 +183,6 @@ pub(crate) fn note_cpu_uploads(base_addr: u64, ranges: &[(usize, usize)]) {
     }
 }
 
-/// Records a live CPU->GPU dirty upload range from `host.rs`.
-pub(crate) fn note_cpu_upload(guest_addr: u64, len: u64) {
-    if !enabled() || len == 0 {
-        return;
-    }
-    CPU_WRITE_EVENTS.fetch_add(1, Ordering::Relaxed);
-    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    let _ = st.coherency.on_cpu_write(guest_addr, len);
-}
-
 /// Records a live declared UAV GPU write range from `host.rs`.
 pub(crate) fn note_gpu_uav_write(guest_addr: u64, len: u64, fence: u64) {
     if !enabled() || len == 0 {

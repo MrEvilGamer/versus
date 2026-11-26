@@ -1468,7 +1468,12 @@ impl<'a> Lower<'a> {
             // `v_readlane`, `v_writelane`, `ds_(b)permute`, masks as numbers or lane-constant
             // masks), nor when LDS may be shared within the console wave without barriers (a
             // group over 32 threads with LDS): those still need 64-lane waves.
-            if wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
+            let lds = |i: &Inst| {
+                matches!(i.fields, Fields::Ds { .. })
+                    && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
+            };
+            let uses_lds = s.lds_dwords > 0 && insts().any(lds);
+            if wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && uses_lds) {
                 let crosses = insts().any(|i| {
                     let n = i.name();
                     n.starts_with("v_mbcnt")
@@ -1478,7 +1483,7 @@ impl<'a> Lower<'a> {
                         || reads_mask_as_data(x.st, i)
                 }) || lane_constant_masks(x.st)
                     || !x.st.wide.is_empty();
-                if !crosses && (s.lds_dwords == 0 || group <= 32) {
+                if !crosses && (!uses_lds || group <= 32) {
                     WAVE_CLASSES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     wave = 32;
                 } else {
@@ -1489,17 +1494,13 @@ impl<'a> Lower<'a> {
                     // two waves of 32, a group barrier before every LDS access keeps their order
                     // – where every thread of the group gets there (no lane branch around it,
                     // no guard), else a barrier would hang the group
-                    let lds = |i: &Inst| {
-                        matches!(i.fields, Fields::Ds { .. })
-                            && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
-                    };
                     if let Some(all) = all_lane_blocks(x.st) {
                         let ok = p.blocks.iter().enumerate().all(|(b, blk)| {
                             blk.insts.iter().all(|inst| {
                                 !lds(inst) || all.get(b).copied().unwrap_or(false)
                             })
                         });
-                        let mut lds_ok = !(s.lds_dwords > 0 && group > 32) || ok;
+                        let mut lds_ok = !(uses_lds && group > 32) || ok;
                         if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &all) {
                             lds_meet = Some((all.clone(), meet));
                             lds_ok = true;
@@ -1515,7 +1516,7 @@ impl<'a> Lower<'a> {
                         }
                         if lds_ok {
                             wave = 32;
-                            split_lds = s.lds_dwords > 0 && group > 32;
+                            split_lds = uses_lds && group > 32;
                             if crosses {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
                                 // numbers go through two exchange dwords past the program's LDS
@@ -1563,15 +1564,19 @@ impl<'a> Lower<'a> {
                     why.sort_unstable();
                     eprintln!("WAVE64-WHY group={group} lds={} [{}]", s.lds_dwords > 0, why.join(", "));
                 }
+            } else if host_max_wave() == 32 {
+                WAVE_CLASSES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             if wave == 32 && x.native.wave64 {
                 // console threads go to host waves in the order the waves take them (`wave_base`)
                 halves = Some(s.lds_dwords);
                 s.lds_dwords += 1;
             }
-            if console_lanes || one_wave && s.lds_dwords > 0 {
+            if console_lanes || one_wave && uses_lds {
                 s.wave_size = Some(wave);
             }
+        } else if host_max_wave() == 32 {
+            WAVE_CLASSES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         // The title's barriers a thread of the group may never reach, which
         // leaves the others waiting on the host: those in blocks some lanes

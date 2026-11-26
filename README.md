@@ -43,7 +43,9 @@ GGVL aims to replace redundant memory scans and transfers with event-driven reso
 | [M1.1 — Hardening](https://github.com/MrEvilGamer/versus/commit/c630bb7) | Per-page ownership, transfer tickets, checked errors and queue-aware dependency structures. |
 | [M2 — Runtime observation](https://github.com/MrEvilGamer/versus/commit/93b6e0a) | Live buffer registration and DXGI memory budget feedback. |
 | [M3 — Write tracking](https://github.com/MrEvilGamer/versus/commit/f0fee0e) | CPU upload and declared UAV write hooks; experimental read-only hash bypass, enabled by default in [75bdd1f](https://github.com/MrEvilGamer/versus/commit/75bdd1f). |
-| [M4 — Residency integration](https://github.com/MrEvilGamer/versus/commit/0346343) | Pressure-aware reclamation cadence and graphics fence feedback. Full eviction/restoration validation pending. |
+| [M4 — Residency integration](https://github.com/MrEvilGamer/versus/commit/0346343) | DXGI usage/budget hysteresis (>92% / ≤82%), lazy eviction candidate sorting, and live empty-pool VRAM reclamation (`704 MiB` reclaimed under pressure). |
+| [M5 — System RAM efficiency](https://github.com/MrEvilGamer/versus/commit/86bb38f) | Adaptive `VICTORY_WINDOW_BUDGET_MB` (512 MB on 16 GB systems, 2048 MB on 32 GB+ systems) and runtime hardware profile detection (`Constrained16GB` vs `HighEnd32GB`). |
+| [M6 — Wave32 & IR optimization](https://github.com/MrEvilGamer/versus/commit/1fcdc87) | Mesa NIR-style algebraic peephole, shift chaining, power-of-2 strength reduction (`bitcode/opt.rs`), Class A/B/C Wave32 classification, and unused-LDS `split_lds` barrier elimination. |
 
 Milestone labels indicate implementation progress, not production certification. Precise sub-page ownership, alias synchronization, lossless event tracking and actual queue dependencies require further validation. Legacy synchronization remains necessary for unsupported or unproven access paths.
 
