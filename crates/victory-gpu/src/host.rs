@@ -4517,8 +4517,13 @@ impl Host {
                             continue;
                         };
                         let base_addr = shadow.start as u64;
-                        for &(a, b) in ranges {
-                            crate::ggvl_bridge::note_cpu_upload(base_addr.saturating_add(a as u64), b.saturating_sub(a) as u64);
+                        if !ranges.is_empty() {
+                            let min_a = ranges.iter().map(|&(a, _)| a).min().unwrap_or(0);
+                            let max_b = ranges.iter().map(|&(_, b)| b).max().unwrap_or(0);
+                            crate::ggvl_bridge::note_cpu_upload(
+                                base_addr.saturating_add(min_a as u64),
+                                max_b.saturating_sub(min_a) as u64,
+                            );
                         }
                         if !whole.iter().any(|s| Arc::ptr_eq(s, shadow))
                             && !declared.iter().any(|(s, _)| Arc::ptr_eq(s, shadow))
