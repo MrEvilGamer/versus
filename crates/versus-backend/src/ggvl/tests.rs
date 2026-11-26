@@ -30,6 +30,7 @@ fn concurrent_cpu_write_during_upload_is_not_lost_on_complete() {
     // Concurrent CPU write hits page 0 while upload is in flight!
     mgr.on_cpu_write(0x2000_0000, 16).unwrap();
     // Completing the old transfer commits page 1, but leaves page 0 CpuAuthoritative!
+    mgr.completed_deps.copy = 1;
     let committed = mgr.complete_transfer(ticket_id).unwrap();
     assert_eq!(committed, 1);
     assert_eq!(mgr.resources[&id].pages[0].state, PageState::CpuAuthoritative);
@@ -47,6 +48,7 @@ fn cancelled_upload_preserves_cpu_authoritative_state() {
         panic!("expected UploadRanges");
     };
     mgr.submit_transfer(ticket_id, QueueDeps { graphics: 0, compute: 0, copy: 2 }).unwrap();
+    mgr.completed_deps.copy = 2;
     mgr.cancel_transfer(ticket_id).unwrap();
     assert_eq!(mgr.resources[&id].pages[0].state, PageState::CpuAuthoritative);
 }
@@ -64,6 +66,8 @@ fn partial_cpu_readback_only_marks_read_range_coherent() {
     };
     assert_eq!(ranges, vec![(0x4000_0000, 0x4000_1000)]);
     assert_eq!(wait_deps, deps);
+    mgr.submit_transfer(ticket_id, QueueDeps { graphics: 0, compute: 0, copy: 1 }).unwrap();
+    mgr.completed_deps = QueueDeps { graphics: 10, compute: 0, copy: 1 };
     mgr.complete_transfer(ticket_id).unwrap();
     assert_eq!(mgr.resources[&id].pages[0].state, PageState::Coherent);
     assert_eq!(mgr.resources[&id].pages[1].state, PageState::GpuAuthoritative);
@@ -178,4 +182,68 @@ fn unified_registry_deduplicates_backing_and_enforces_adaptive_eviction_order() 
     reg.get_mut(AllocationId(2)).unwrap().resident = false;
     let batch = reg.plan_submission_residency(&[AllocationId(1), AllocationId(2)], false);
     assert_eq!(batch, vec![backing_shared]);
+}
+
+#[test]
+fn transfer_lifecycle_rejects_premature_completion_and_duplicate_plans() {
+    let mut mgr = ResourceCoherencyManager::default();
+    let id = mgr.register(0x7000, 8192, false, ResidencyPriority::High).unwrap();
+    mgr.on_cpu_write(0x7000, 8192).unwrap();
+    let SyncPlan::UploadRanges { ticket_id, .. } = mgr.plan_gpu_read(id, 0x7000, 4096, 1).unwrap()
+    else { panic!("expected upload"); };
+    assert_eq!(mgr.complete_transfer(ticket_id), Err(GgvlError::InFlight(id)));
+    assert_eq!(mgr.unregister(id), Err(GgvlError::InFlight(id)));
+    assert_eq!(mgr.plan_gpu_read(id, 0x7000, 4096, 2), Err(GgvlError::InFlight(id)));
+    assert_eq!(mgr.plan_cpu_read(id, 0x7000, 4096), Err(GgvlError::InFlight(id)));
+    let deps = QueueDeps { graphics: 3, compute: 2, copy: 1 };
+    mgr.submit_transfer(ticket_id, deps).unwrap();
+    assert_eq!(mgr.submit_transfer(ticket_id, QueueDeps::default()), Err(GgvlError::InFlight(id)));
+    mgr.completed_deps = QueueDeps { graphics: 3, compute: 1, copy: 1 };
+    assert_eq!(mgr.complete_transfer(ticket_id), Err(GgvlError::InFlight(id)));
+    assert_eq!(mgr.cancel_transfer(ticket_id), Err(GgvlError::InFlight(id)));
+    assert!(mgr.tickets.contains_key(&ticket_id));
+    assert_eq!(mgr.resources[&id].pages[0].state, PageState::CpuToGpuPending { ticket_id });
+    mgr.completed_deps.compute = 2;
+    assert_eq!(mgr.complete_transfer(ticket_id), Ok(1));
+    assert_eq!(mgr.resources[&id].pages[0].state, PageState::Coherent);
+    assert_eq!(mgr.resources[&id].pages[1].state, PageState::CpuAuthoritative);
+    assert!(mgr.unregister(id).is_ok());
+}
+
+#[test]
+fn cancel_unsubmitted_ticket_leaves_ownership_unchanged() {
+    let mut mgr = ResourceCoherencyManager::default();
+    let id = mgr.register(0x9000, 4096, false, ResidencyPriority::High).unwrap();
+    mgr.on_cpu_write(0x9000, 4096).unwrap();
+    let SyncPlan::UploadRanges { ticket_id, .. } = mgr.plan_gpu_read(id, 0x9000, 4096, 1).unwrap()
+    else { panic!("expected upload"); };
+    mgr.on_gpu_write(id, 0x9000, 4096, QueueDeps::default()).unwrap();
+    mgr.cancel_transfer(ticket_id).unwrap();
+    assert_eq!(mgr.resources[&id].pages[0].state, PageState::GpuAuthoritative);
+}
+
+#[test]
+fn transfer_waits_for_source_queue_and_copy_completion() {
+    let mut mgr = ResourceCoherencyManager::default();
+    let id = mgr.register(0xb000, 4096, false, ResidencyPriority::High).unwrap();
+    mgr.on_gpu_write(id, 0xb000, 4096, QueueDeps { graphics: 4, compute: 3, copy: 0 }).unwrap();
+    let SyncPlan::DownloadRanges { ticket_id, .. } = mgr.plan_cpu_read(id, 0xb000, 4096).unwrap()
+    else { panic!("expected download"); };
+    mgr.submit_transfer(ticket_id, QueueDeps { graphics: 0, compute: 0, copy: 2 }).unwrap();
+    mgr.completed_deps.copy = 2;
+    assert_eq!(mgr.complete_transfer(ticket_id), Err(GgvlError::InFlight(id)));
+    mgr.completed_deps.graphics = 4;
+    mgr.completed_deps.compute = 3;
+    assert_eq!(mgr.complete_transfer(ticket_id), Ok(1));
+}
+
+#[test]
+fn transfer_range_end_does_not_overflow_at_address_limit() {
+    let mut mgr = ResourceCoherencyManager::default();
+    let start = u64::MAX - 17;
+    let id = mgr.register(start, 17, false, ResidencyPriority::High).unwrap();
+    mgr.on_cpu_write(start, 17).unwrap();
+    let SyncPlan::UploadRanges { ranges, .. } = mgr.plan_gpu_read(id, start, 17, 1).unwrap()
+    else { panic!("expected upload"); };
+    assert_eq!(ranges, vec![(start, u64::MAX)]);
 }
