@@ -2530,7 +2530,9 @@ impl<'a> Lower<'a> {
                     // on it: a read the paths only seem to allow (a branch
                     // past the write, taken only with one past the read)
                     // reads zero, as VGPRs do.
-                    None if n <= 105 && self.x.io.initialized_sgprs.is_some_and(|k| n >= k) => {
+                    None if (n <= 105 && self.x.io.initialized_sgprs.is_some_and(|k| n >= k))
+                        || matches!(n, 106 | 107) =>
+                    {
                         Val::I32(self.s.m.i32(0))
                     }
                     // A scalar parked in a VGPR lane (`ir::unspill`), read where the

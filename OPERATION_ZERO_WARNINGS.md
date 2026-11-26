@@ -35,7 +35,8 @@
 25. **Cycle 24 (`8344132`):** Raised `MAX_JOINS` from `8` to `12` in `resource.rs` — **`a descriptor joined too often`: `4 → 0` (23rd category eliminated!, `31 → 30` categories), `0` errors!**
 26. **Cycle 25 (`446261a`):** Added `s_bfm_b64`/`s_bfm_b32` and `s_bitreplicate_b64_b32` constant `exec` masks to `emit/wave.rs` — **`a whole-wave section step the simulation does not follow`: `9 → 6` (`-3`), `host_created: 515 → 519` (`+4`), Total `WARN`: `419 → 417`, Unique Failed Shaders: `394 → 392`, `0` errors!**
 27. **Cycle 26 (`70aa955`):** Implemented `s_flbit_i32_b64` in `lower.rs` — **`s_flbit_i32_b64`: `1 → 0` (24th category eliminated!), `host_created: 519 → 521` (`+2`), Total `WARN`: `417 → 413` (`-70.3%` from `1,392` baseline), Unique Failed Shaders: `392 → 388`, `0` errors!**
-28. **Cycle 27:** Resolved multi-block descriptor phis by expanding the latest RPO block first in `resource.rs` — **`a descriptor joined in several blocks`: `3 → 0` (25th category eliminated!, `30 → 29` categories), `host_created: 521 → 523` (`+2`), `0` errors!**
+28. **Cycle 27 (`2c8c2ee`):** Resolved multi-block descriptor phis by expanding the latest RPO block first in `resource.rs` — **`a descriptor joined in several blocks`: `3 → 0` (25th category eliminated!, `30 → 29` categories), `host_created: 521 → 523` (`+2`), `0` errors!**
+29. **Cycle 28:** Treated `vcc_lo`/`vcc_hi` (`106 | 107`) on entry as uninitialized zero in `lower.rs` — **`a hardware SGPR input`: `6 → 0` (26th category eliminated!, `29 → 28` categories), `7` shaders restored (`388 → 381`), `host_created: 523 → 530` (`+7`), Total `WARN`: `413 → 406` (`-70.8%` from `1,392` baseline), `0` errors!**
 
 ## Remaining Top Shader Failure Categories (Baseline `ae08fb7`)
 | Unique Shaders | Category |
