@@ -1,95 +1,113 @@
-# VIctory on an RX 7900 XTX
+# Versus
 
-A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
-that runs an Xbox Series title natively on Windows from files the user supplies.
-This one is about **speed on AMD RDNA 3**: the world at 30 frames a second on
-one PC, without giving up the picture. It is not there yet.
+**Experimental Xbox Series compatibility layer for Windows — focused on NVIDIA GPU performance, memory efficiency and rendering correctness.**
 
-**This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by the game's developer
-or publisher.
+Versus extends [VIctory](https://github.com/Marvisak/VIctory) and its community forks with a tuned Direct3D 12 backend and an incremental Guest GPU Virtualization Layer (GGVL).
 
-## Where it stands (2026-11-25)
+[Architecture](docs/architecture.md) · [Performance roadmap](docs/30-60-fps-roadmap.md) · [Technical findings](docs/findings.md) · [Frame replay](docs/replay.md)
 
-Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
-RX 7900 XTX, 1440p, the Series X profile.
+> **Active development:** Stable 30 FPS is the initial engineering target, with 60 FPS a longer-term investigation where hardware permits. Neither is currently demonstrated on the target NVIDIA hardware.
 
-| | |
+This repository contains no game files, proprietary game code or game assets. Users must provide their own legitimately obtained compatible files. Versus is not affiliated with or endorsed by any game developer, publisher or console manufacturer.
+
+## Development snapshot — November 26, 2026
+
+### NVIDIA performance
+
+Reported local development benchmarks on an RTX 4060 Ti (8 GB), Ryzen 9 7900X, 32 GB RAM and Windows 11.
+
+| Metric | Initial baseline | [M2](https://github.com/MrEvilGamer/versus/commit/93b6e0a) | [M3](https://github.com/MrEvilGamer/versus/commit/75bdd1f) |
+|---|---:|---:|---:|
+| Reported in-game FPS | 1.6 | 5.3 | 5.7 |
+| Frame time | 637.3 ms | 187.1 ms | 176.4 ms |
+| CPU preparation | 260.8 ms | 85.9 ms | 70.4 ms |
+| GPU execution | 403.4 ms | 94.8 ms | 101.6 ms |
+| Copy-back / readback | 424.0 ms | 28.1 ms | 25.1 ms |
+| Heap buffer pass | 138.0 ms | 5.9 ms | 2.7 ms |
+
+Milestone 3 reports a reduction from **197–240 to 13–20 hash passes per frame**, with 738 read-only hash skips during the benchmark and 4,286 tracked buffers.
+
+These are preliminary reported local measurements, not independently reproduced results. Timing categories may overlap. The NVIDIA profile defaults to 640×360 and a 256-pixel texture dimension cap. Reduced graphics quality, disabled safeguards, and architectural improvements must be distinguished in comparisons. Sustained FPS, matched-scene repeat runs and correctness validation remain outstanding.
+
+### Historical AMD results
+
+The inherited AMD-focused fork reported 13–20 FPS indoors, 19–22 FPS during the first boat mission, and 6–10 FPS during a busy street chase on a Radeon RX 7900 XTX at 1440p (i9-12900K, 64 GB RAM, November 25). It also reported 40–46 GB of process private memory. These are historical upstream results, not directly comparable NVIDIA benchmarks.
+
+## Guest GPU Virtualization Layer
+
+GGVL aims to replace redundant memory scans and transfers with event-driven resource tracking, demand-driven synchronization and budget-aware memory management. It is not yet the authoritative memory system.
+
+| Milestone | Implementation status |
 |---|---|
-| Menus, videos, loading screens | 30 fps |
-| Prologue, indoors | 50-75 ms a frame (13-20 fps) |
-| First mission with the boat | 46-53 ms (19-22 fps) |
-| Street chase with many cars and people | 100-165 ms (6-10 fps), single frames far longer |
-| Outdoors on foot, the camp | 60-90 ms |
-| Flying | 42-57 ms |
-| Longest session so far | 41 minutes, no crash |
-| Memory | 40-46 GB of private memory: **64 GB of RAM recommended** |
+| [M1 — Foundations](https://github.com/MrEvilGamer/versus/commit/5fc2e25) | Page table, coherency model, residency candidate selection and preliminary wave classifier. |
+| [M1.1 — Hardening](https://github.com/MrEvilGamer/versus/commit/c630bb7) | Per-page ownership, transfer tickets, checked errors and queue-aware dependency structures. |
+| [M2 — Runtime observation](https://github.com/MrEvilGamer/versus/commit/93b6e0a) | Live buffer registration and DXGI memory budget feedback. |
+| [M3 — Write tracking](https://github.com/MrEvilGamer/versus/commit/f0fee0e) | CPU upload and declared UAV write hooks; experimental read-only hash bypass, enabled by default in [75bdd1f](https://github.com/MrEvilGamer/versus/commit/75bdd1f). |
+| [M4 — Residency integration](https://github.com/MrEvilGamer/versus/commit/0346343) | Pressure-aware reclamation cadence and graphics fence feedback. Full eviction/restoration validation pending. |
 
-It started at 280 ms a frame in the same scenes two days earlier.
+Milestone labels indicate implementation progress, not production certification. Precise sub-page ownership, alias synchronization, lossless event tracking and actual queue dependencies require further validation. Legacy synchronization remains necessary for unsupported or unproven access paths.
 
-What is known to be wrong:
+## Engineering roadmap
 
-- Trees, plants and far buildings flicker outdoors in some places.
-- Rooms with little direct light are too dark without `-RayTracing`.
-- Textures of what just came into view appear late while the title streams.
-- The first run with a new driver or a new build stutters while the driver makes
-  pipelines (`victory warm` makes them ahead).
-- Recording a frame in the world makes the title's own watchdog end it.
+- [x] Initial GGVL runtime observation and memory budget telemetry
+- [x] Initial CPU upload and declared GPU write tracking
+- [x] Experimental read-only hash bypass
+- [ ] Validate all write paths, aliases, partial writes and queue dependencies
+- [ ] Safely eliminate redundant hashes, comparisons and eager readbacks
+- [ ] Implement and validate fence-safe eviction, restoration and adaptive VRAM residency
+- [ ] Reduce system RAM pressure and PCIe spilling
+- [ ] Optimize existing Wave64-to-Wave32 shader translation
+- [ ] Reduce CPU submission and descriptor overhead
+- [ ] Demonstrate sustained 30 FPS at documented quality settings
+- [ ] Investigate 60 FPS where hardware permits
 
-## How to run it
+D3D12 remains the active backend. Vulkan is a potential future investigation, not an implemented alternative.
 
-You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
-model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
-tools, and your own dump of the title.
+## Build from source
+
+Requirements: Windows 10/11 x64, AVX2-capable CPU, a Direct3D 12 GPU supporting shader model 6.6 and mesh shaders, Rust (see [rust-toolchain.toml](rust-toolchain.toml)), MSVC build tools and compatible title files. An 8 GB GPU and 32 GB RAM are development targets, not guaranteed minimum requirements.
 
 ```powershell
-git clone https://github.com/avatarmanz/VIctory-7900XTX
-cd VIctory-7900XTX
-copy victory.example.toml victory.toml      # then set your paths, outside this folder
+git clone https://github.com/MrEvilGamer/versus.git
+cd versus
+Copy-Item victory.example.toml victory.toml
+# Configure paths in victory.toml before running.
 cargo build --locked --profile diag -p victory --features diagnostics
-scripts\play.ps1 -Exe <path of your copy's executable>
+.\target\diag\versus.exe --help
 ```
 
-`scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
-something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
+The Cargo package is still named `victory`, but the executable is `versus.exe`. Some inherited scripts still reference `victory.exe`; check their executable paths before use.
 
-Before the first run, ahead of time (both can be stopped and go on later):
+### Experimental configuration
 
-```powershell
-target\diag\victory.exe shaders <the shader archives>   # every shader translated, minutes
-target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
-```
+Defaults are defined in [versus-backend/src/lib.rs](crates/versus-backend/src/lib.rs) and can be overridden before launch.
 
-Commands, debugging switches and upstream's own description:
-[docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
-described in a comment where it is read.
+| Variable | Purpose |
+|---|---|
+| `VICTORY_GGVL=0` | Disable GGVL observation. |
+| `VICTORY_GGVL_SKIP_READONLY_HASH=0` | Disable experimental read-only hash bypass for comparisons and troubleshooting. |
+| `VICTORY_DISPLAY_MODE` | Output resolution. |
+| `VICTORY_MAX_TEXTURE_DIM` | Texture dimension limit; affects visual quality. |
+| `VICTORY_VIDEO_BUDGET_MB` | Configured video-memory budget. |
 
-## What is different here
+The NVIDIA profile also modifies watchdog, residency waiting and BVH behavior. Maintain consistent settings during benchmark comparisons.
 
-In short; the reasons and the measurements are in [docs/findings.md](docs/findings.md).
+## Known limitations
 
-- **List calls are written down, not carried out, on the title's threads**
-  (`VICTORY_THIN`): eight threads of ours translate them.
-- **Submissions are prepared by a thread of ours and joined**
-  (`VICTORY_ASYNC_SUBMIT`, `VICTORY_JOIN_PARTS`), with what can be spread over
-  threads spread: refreshes, compares (AVX2), descriptor records, landings.
-- **What shaders wrote comes back beside the write guards**, by the dwords that
-  changed, on a thread of its own (`VICTORY_RELAY`, `VICTORY_LAND`).
-- **Buffer fills that need bytes still on the card are done on the card**
-  (`VICTORY_CARD_STEPS`) instead of waiting for it.
-- **The title's writes are caught more cheaply**: one view opened at a fault,
-  blocks that rest, places in the title's code that look before they write.
-- **Textures go up on a copy queue of their own** and a slot shows one only after
-  its upload ran, which also ended a device loss that came every 15 minutes or so.
-- **Boats float**: textures that shaders write and the title's CPU reads go back
-  to title memory (from fxceless and Geckomacabre, on by default here).
-- **Frame record and replay** with per-pass times and shader variants compared
-  turn by turn ([docs/replay.md](docs/replay.md)).
+Inherited issues include outdoor flicker, dim interiors without ray-traced indirect lighting, delayed texture streaming, pipeline compilation stutter and watchdog interruptions during frame capture. The new GGVL path requires further regression and long-session testing.
+
+## Documentation
+
+- [30–60 FPS roadmap](docs/30-60-fps-roadmap.md)
+- [Architecture](docs/architecture.md)
+- [Historical findings](docs/findings.md)
+- [Frame capture and replay](docs/replay.md)
+- [Upstream commands and debugging](docs/README-fxceless.md)
+- [Asset policy](docs/asset-policy.md)
 
 ## Credits
 
-This is a tree of other people's work with more on top. The history is kept, and
-commits taken from elsewhere name the commit and its author.
+Versus builds on the VIctory community, including [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX). Upstream history and contributor attribution are retained.
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
   contributors: the loader, the runtime services, the Direct3D 12 back end and
