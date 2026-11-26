@@ -284,11 +284,12 @@ fn unspill(
             Operand::Const(c @ 128..=191) => Some(u32::from(c) - 128),
             _ => None,
         };
+        let scalar_ok = |c: u8| c < 105 || matches!(c, 106 | 107);
         match (inst.name()?, v.dst?, v.src.as_slice()) {
-            ("v_writelane_b32", Operand::Vector { reg, .. }, [Operand::Scalar { code, .. }, k]) if *code < 105 => {
+            ("v_writelane_b32", Operand::Vector { reg, .. }, [Operand::Scalar { code, .. }, k]) if scalar_ok(*code) => {
                 Some((true, reg, *code, lane(k)?))
             }
-            ("v_readlane_b32", Operand::Scalar { code, .. }, [Operand::Vector { reg, .. }, k]) if code < 105 => {
+            ("v_readlane_b32", Operand::Scalar { code, .. }, [Operand::Vector { reg, .. }, k]) if scalar_ok(code) => {
                 Some((false, *reg, code, lane(k)?))
             }
             _ => None,

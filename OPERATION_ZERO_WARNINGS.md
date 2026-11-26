@@ -16,7 +16,8 @@
 6. **Cycle 3 (`d41330e`):** Enabled `made_raw` for `tbuffer_*_format` instructions in `resource.rs` — **204 shaders advanced** past `"a descriptor changed after loading"` (`316 → 112`).
 7. **Cycle 4 (`98e07d9`):** Implemented `Input::GroupInfo` (`TG_SIZE_EN` SGPR) in `lower.rs` — **`the thread-group info SGPR`: `6 → 0`**, **`4` more shaders fully restored (`672 → 668`), `host_created: 244 → 248`!**
 8. **Cycle 5 (`0a25f7b`):** Fixed `wide` dispatch for `s_bitreplicate_b64_b32` in `lower.rs` — **`s_bitreplicate_b64_b32`: `3 → 0`**, **`a select on an untracked mask`: `4 → 0`**, **`2` more shaders fully restored (`668 → 666`), `host_created: 248 → 250`!**
-9. **Cycle 6:** Implemented packed literal & inline f16 broadcast constant operands for `v_pk_fmac_f16` in `lower.rs` — **`a constant operand of v_pk_fmac_f16`: `2 → 0`**, **`2` more shaders fully restored (`666 → 664`), `host_created: 250 → 252` (+87 total since `1dfee4a`)!**
+9. **Cycle 6 (`559ae39`):** Implemented packed literal & inline f16 broadcast constant operands for `v_pk_fmac_f16` in `lower.rs` — **`a constant operand of v_pk_fmac_f16`: `2 → 0`**, **`2` more shaders fully restored (`666 → 664`), `host_created: 250 → 252` (+87 total since `1dfee4a`)!**
+10. **Cycle 8:** Allowed `vcc_lo`/`vcc_hi` (`106 | 107`) in `ir::unspill::parked()` (`ir.rs`) so spill VGPRs like `v141` are promoted to scalar moves (`a descriptor neither loaded nor built`: `65 → 63`, `0` errors).
 
 ## Remaining Top Shader Failure Categories (Baseline `ae08fb7`)
 | Unique Shaders | Category |
