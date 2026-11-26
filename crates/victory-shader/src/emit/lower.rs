@@ -6127,6 +6127,16 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Shl, a, sh);
                 (self.s.m.bin(c, Bin::AShr, t, sh), None)
             }
+            "s_absdiff_i32" => {
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let diff = self.s.m.bin(c, Bin::Sub, a, b);
+                let zero = self.s.m.i32(0);
+                let neg = self.s.m.bin(c, Bin::Sub, zero, diff);
+                let lt = self.s.m.cmp(c, pred::SLT, a, b);
+                let abs = self.s.m.select(c, lt, neg, diff);
+                let nz = self.s.m.cmp(c, pred::NE, abs, zero);
+                (abs, Some(nz))
+            }
             _ => return Err(name),
         };
         self.set(lo, Val::I32(r));
