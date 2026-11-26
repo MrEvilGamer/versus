@@ -21,8 +21,8 @@ use crate::structure::{Bool, LaneExit, Meets, Structured};
 /// An instruction: block and index in [`crate::ir::Block::insts`].
 pub type Site = (usize, usize);
 
-/// A byte address: a root parameter's, plus a constant and at most one
-/// value the program computes (an index times a stride, say).
+/// A byte address: a root parameter's, plus a constant and up to two
+/// values the program computes (e.g. a base index plus an instruction offset register).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Address {
     /// Index into the layout, or [`CODE`].
@@ -31,6 +31,7 @@ pub struct Address {
     /// descriptor's address).
     pub offset: u32,
     pub dynamic: Option<Value>,
+    pub dynamic2: Option<Value>,
 }
 
 /// [`Address::param`] of the program's own code: a constant table the
@@ -881,6 +882,7 @@ impl<'a> Tracer<'a> {
                 param: MEMORY,
                 offset: 0,
                 dynamic: None,
+                dynamic2: None,
             })
         } else {
             Err(why)
@@ -945,9 +947,10 @@ impl<'a> Tracer<'a> {
             _ => hi,
         };
         let s = self.sum(lo);
-        if s.dynamic.is_some() && extra.dynamic.is_some() {
-            return Err("an address with two computed terms");
-        }
+        let (dynamic, dynamic2) = match (s.dynamic, extra.dynamic) {
+            (Some(a), Some(b)) => (Some(a), Some(b)),
+            (a, b) => (a.or(b), None),
+        };
         let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
         if let Some(pc) = self.getpc(base) {
             // A table in the code: the base is the next instruction's offset.
@@ -962,7 +965,8 @@ impl<'a> Tracer<'a> {
             return Ok(Address {
                 param: CODE,
                 offset: first.wrapping_add(s.offset).wrapping_add(extra.offset),
-                dynamic: s.dynamic.or(extra.dynamic),
+                dynamic,
+                dynamic2,
             });
         }
         let reg = self.inputs[base.0 as usize].ok_or("an address not from a root parameter")?;
@@ -980,7 +984,6 @@ impl<'a> Tracer<'a> {
         };
         // shortcut: with a computed term, a high half that adds anything to the
         // base's is taken as the carry of that term (offsets below 4 GB).
-        let dynamic = s.dynamic.or(extra.dynamic);
         if !self.high_half(hi, high)
             && !(dynamic.is_some() && high.is_some_and(|h| self.carried(hi, h)))
         {
@@ -989,7 +992,8 @@ impl<'a> Tracer<'a> {
         Ok(Address {
             param,
             offset: s.offset.wrapping_add(extra.offset),
-            dynamic: s.dynamic.or(extra.dynamic),
+            dynamic,
+            dynamic2,
         })
     }
 
@@ -2467,6 +2471,7 @@ pub(crate) mod tests {
             param,
             offset,
             dynamic: None,
+            dynamic2: None,
         }
     }
 

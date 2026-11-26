@@ -1874,7 +1874,7 @@ impl<'a> Lower<'a> {
         };
         let c = self.cur;
         let mut off = self.s.m.i32(a.offset);
-        if let Some(d) = a.dynamic {
+        for d in [a.dynamic, a.dynamic2].into_iter().flatten() {
             let d = self.i32_of(d)?;
             off = self.s.m.bin(c, Bin::Add, off, d);
         }
@@ -6758,7 +6758,7 @@ impl<'a> Lower<'a> {
         };
         let c = self.cur;
         let mut addr = self.s.m.i32(a.offset);
-        if let Some(value) = a.dynamic {
+        for value in [a.dynamic, a.dynamic2].into_iter().flatten() {
             let mut d = self.i32_of(value)?;
             // A term held per lane reached the address through
             // `v_readfirstlane_b32`: the first lane's.
@@ -7145,6 +7145,13 @@ impl<'a> Lower<'a> {
                     Some(v) => Some(self.i32_of(v)?),
                     None => None,
                 };
+                if let Some(v2) = address.dynamic2 {
+                    let d2 = self.i32_of(v2)?;
+                    x = Some(match x {
+                        Some(d) => self.s.m.bin(self.cur, Bin::Add, d, d2),
+                        None => d2,
+                    });
+                }
                 if let Some(bias) = self.root_bias(address.param) {
                     x = Some(match x {
                         Some(d) => self.s.m.bin(self.cur, Bin::Add, d, bias),
