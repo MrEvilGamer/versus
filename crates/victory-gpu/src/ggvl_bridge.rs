@@ -55,7 +55,7 @@ impl GgvlState {
                 backing_id: BackingStorageId(key.0),
                 kind: AllocationKind::ShadowBuffer,
                 size_bytes: len,
-                segment: MemorySegment::LocalVram,
+                segment: MemorySegment::SystemRam,
                 last_access_frame: 0,
                 access_frequency: 1,
                 ownership: OwnershipState::CpuAuthoritative,
@@ -243,20 +243,23 @@ pub(crate) fn on_vram_budget(budget_bytes: u64, usage_bytes: u64) {
             // The sorted candidate list is telemetry only. Do not rebuild it
             // on every budget query; reclamation uses the independent pressure bit.
             let evict = st.residency.select_evictions(&st.coherency);
-            let tracked_backing_mb = st.registry.total_unique_backing_bytes() >> 20;
+            let total_tracked_mb = st.registry.total_unique_backing_bytes() >> 20;
             let tex_heap_mb = TEX_HEAP_BYTES.load(Ordering::Relaxed) >> 20;
-            let shadow_mb = tracked_backing_mb.saturating_sub(tex_heap_mb);
+            let local_shadow_mb = SHADOW_BUF_BYTES.load(Ordering::Relaxed) >> 20;
+            let sys_shadow_mb = total_tracked_mb.saturating_sub(tex_heap_mb + local_shadow_mb);
+            let local_tracked_mb = tex_heap_mb + local_shadow_mb;
             let reclaim_req_mb = st.controller.reclamation_required_bytes() >> 20;
             let usage_mb = usage_bytes >> 20;
-            let unaccounted_mb = usage_mb.saturating_sub(tracked_backing_mb);
+            let unaccounted_local_mb = usage_mb.saturating_sub(local_tracked_mb);
             tracing::info!(
                 pressure,
                 budget_mb = budget_bytes >> 20,
                 usage_mb,
-                tracked_backing_mb,
+                local_tracked_mb,
                 tex_heap_mb,
-                shadow_mb,
-                unaccounted_mb,
+                local_shadow_mb,
+                sys_shadow_mb,
+                unaccounted_local_mb,
                 reclaim_req_mb,
                 tracked = st.coherency.resources.len(),
                 cpu_writes = CPU_WRITE_EVENTS.load(Ordering::Relaxed),

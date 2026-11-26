@@ -685,6 +685,7 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
 ];
+static LAST_WINDOW_DRAWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Host buffers made since the start, as (count, bytes): in the upload heap
 /// (staging, list scratch), shared with the processor (host copies of title
@@ -8984,6 +8985,7 @@ impl Meter {
                 if let Some(csv_path) = std::env::var_os("VICTORY_FRAME_CSV") {
                     use std::io::Write;
                     let (vram_budget_mb, vram_usage_mb) = crate::ggvl_bridge::vram_snapshot_mb();
+                    LAST_WINDOW_DRAWS.store(draws as u64, Ordering::Relaxed);
                     let new_file = !std::path::Path::new(&csv_path).exists();
                     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&csv_path) {
                         if new_file {
@@ -9066,7 +9068,7 @@ impl Host {
                 let file = std::fs::OpenOptions::new().create(true).truncate(true).write(true).open(&path).ok();
                 let mut w = file.map(std::io::BufWriter::new);
                 if let Some(ref mut bw) = w {
-                    let _ = writeln!(bw, "frame_id,ts_ms,frame_ms,vram_budget_mb,vram_usage_mb");
+                    let _ = writeln!(bw, "frame_id,ts_ms,frame_ms,draws,vram_budget_mb,vram_usage_mb");
                 }
                 Mutex::new(w.map(|bw| (bw, now_ms(), 0u64)))
             });
@@ -9079,7 +9081,19 @@ impl Host {
                 *last_ms = cur;
                 *count += 1;
                 let (b_mb, u_mb) = crate::ggvl_bridge::vram_snapshot_mb();
-                let _ = writeln!(bw, "{frame},{cur},{dt},{b_mb},{u_mb}");
+                let draws = LAST_WINDOW_DRAWS.load(Ordering::Relaxed);
+                let _ = writeln!(bw, "{frame},{cur},{dt},{draws},{b_mb},{u_mb}");
+                if dt >= 250 && draws > 100 {
+                    tracing::warn!(
+                        frame,
+                        frame_ms = dt,
+                        draws,
+                        vram_budget_mb = b_mb,
+                        vram_usage_mb = u_mb,
+                        making_pipelines = crate::pipeline::making(),
+                        "ugee: gameplay frame-time spike >= 250ms"
+                    );
+                }
                 if *count % 60 == 0 {
                     let _ = bw.flush();
                 }
