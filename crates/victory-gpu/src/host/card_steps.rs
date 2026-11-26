@@ -933,18 +933,34 @@ const POOLED: usize = 32;
 /// made and let go (for the frame line: what the pool holds).
 static MADE: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
-/// Back into the pool once landed; past [`POOLED`] the smallest goes, as it
-/// serves the fewest submissions.
+/// Back into the pool once landed; bounded by both entry count (`POOLED`) and
+/// total device-local VRAM bytes (128 MiB normally, 32 MiB under DXGI pressure).
 fn pool(own: Own) {
-    let gone = {
+    const POOLED_MAX_BYTES: u64 = 128 << 20;
+    const POOLED_PRESSURE_BYTES: u64 = 32 << 20;
+    let byte_cap = if crate::ggvl_bridge::vram_under_pressure() {
+        POOLED_PRESSURE_BYTES
+    } else {
+        POOLED_MAX_BYTES
+    };
+    let mut dropped = Vec::new();
+    {
         let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
         pool.push(own);
-        (pool.len() > POOLED)
-            .then(|| pool.iter().enumerate().min_by_key(|(_, o)| o.size).map(|(i, _)| i))
-            .flatten()
-            .map(|i| pool.swap_remove(i))
-    };
-    if let Some(gone) = gone {
+        let mut total: u64 = pool.iter().map(|o| o.size).sum();
+        while pool.len() > POOLED || (pool.len() > 1 && total > byte_cap) {
+            let idx = if total > byte_cap {
+                pool.iter().enumerate().max_by_key(|(_, o)| o.size).map(|(i, _)| i)
+            } else {
+                pool.iter().enumerate().min_by_key(|(_, o)| o.size).map(|(i, _)| i)
+            };
+            let Some(i) = idx else { break };
+            let gone = pool.swap_remove(i);
+            total = total.saturating_sub(gone.size);
+            dropped.push(gone);
+        }
+    }
+    for gone in dropped {
         MADE[2].fetch_add(gone.size, Ordering::Relaxed);
     }
 }
