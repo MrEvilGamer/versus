@@ -17,9 +17,9 @@ pub enum BackendKind {
 /// Every entry is only set when the user has not explicitly provided a value.
 const NVIDIA_DEFAULTS: &[(&str, &str)] = &[
     ("VICTORY_NO_WATCHDOG", "1"),
-    ("VICTORY_DISPLAY_MODE", "960x540"),
+    ("VICTORY_DISPLAY_MODE", "640x360"),
     ("VICTORY_LEVELS_ON_DEMAND", "1"),
-    ("VICTORY_MAX_TEXTURE_DIM", "512"),
+    ("VICTORY_MAX_TEXTURE_DIM", "256"),
     ("VICTORY_VIDEO_BUDGET_MB", "5500"),
     ("VICTORY_TEXTURE_NO_WAIT", "1"),
     ("VICTORY_TEXTURE_BACK", "1"),
@@ -27,7 +27,7 @@ const NVIDIA_DEFAULTS: &[(&str, &str)] = &[
     ("VICTORY_INDIRECT_GATHER", "1"),
     ("VICTORY_HOIST_CLAMPS", "1"),
     ("VICTORY_CARD_BUFFERS_MIN_MB", "1"),
-    ("VICTORY_CARD_BUFFERS_MB", "896"),
+    ("VICTORY_CARD_BUFFERS_MB", "1024"),
     ("VICTORY_CARD_HASH_LEN", "1"),
     ("VICTORY_CARD_HASH_WIDE", "1"),
     ("VICTORY_CARD_REHASH_RUNS", "1"),
