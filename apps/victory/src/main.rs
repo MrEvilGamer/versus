@@ -20,9 +20,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(
-    name = "victory",
+    name = "versus",
     version,
-    about = "Run an Xbox Series title natively on Windows"
+    about = "Versus: NVIDIA-first Xbox Series compatibility layer on Windows"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -169,6 +169,7 @@ enum Console {
 
 fn main() -> Result<()> {
     victory_core::logging::init("info");
+    let _backend = versus_backend::apply_nvidia_defaults();
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {
