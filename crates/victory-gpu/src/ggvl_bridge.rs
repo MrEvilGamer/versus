@@ -168,6 +168,21 @@ pub(crate) fn note_evicted(guest_addr: u64, len: u64) {
     }
 }
 
+/// Records exact disjoint CPU->GPU dirty upload ranges for one buffer under a single lock.
+pub(crate) fn note_cpu_uploads(base_addr: u64, ranges: &[(usize, usize)]) {
+    if !enabled() || ranges.is_empty() {
+        return;
+    }
+    CPU_WRITE_EVENTS.fetch_add(ranges.len() as u64, Ordering::Relaxed);
+    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    for &(a, b) in ranges {
+        let len = b.saturating_sub(a) as u64;
+        if len > 0 {
+            let _ = st.coherency.on_cpu_write(base_addr.saturating_add(a as u64), len);
+        }
+    }
+}
+
 /// Records a live CPU->GPU dirty upload range from `host.rs`.
 pub(crate) fn note_cpu_upload(guest_addr: u64, len: u64) {
     if !enabled() || len == 0 {
