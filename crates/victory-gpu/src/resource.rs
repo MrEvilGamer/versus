@@ -1854,6 +1854,9 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     if let Some(limit) = limit {
         return filled < limit;
     }
+    if crate::ggvl_bridge::vram_under_pressure() {
+        return false;
+    }
     let floor = texture_floor_bytes(memory.map(|[budget, ..]| budget));
     if filled < floor {
         return true;

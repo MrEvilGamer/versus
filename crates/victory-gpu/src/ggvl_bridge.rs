@@ -147,6 +147,10 @@ static NEXT_HEAP_ID: AtomicU64 = AtomicU64::new(1);
 static TEX_HEAP_BYTES: AtomicU64 = AtomicU64::new(0);
 static SHADOW_BUF_BYTES: AtomicU64 = AtomicU64::new(0);
 
+pub(crate) fn set_local_shadow_bytes(bytes: u64) {
+    SHADOW_BUF_BYTES.store(bytes, Ordering::Relaxed);
+}
+
 pub(crate) fn vram_snapshot_mb() -> (u64, u64) {
     (
         LAST_BUDGET_BYTES.load(Ordering::Relaxed) >> 20,
