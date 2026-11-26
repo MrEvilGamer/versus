@@ -45,6 +45,8 @@ const NVIDIA_DEFAULTS: &[(&str, &str)] = &[
     // avatarmanz 25-FPS engine switches
     ("VICTORY_SEND_OWN", "1"),
     ("VICTORY_UP_QUEUE", "1"),
+    ("VICTORY_RELAY", "2"),
+    ("VICTORY_RELAY_COPY", "1"),
     ("VICTORY_JOIN_BARRIERS", "1"),
     ("VICTORY_SYNC_IN_PLACE", "1"),
     ("VICTORY_SPANS_QUICK", "1"),
