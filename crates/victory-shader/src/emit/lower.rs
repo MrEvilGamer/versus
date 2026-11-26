@@ -12233,6 +12233,21 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        if !typed
+            && index.is_none()
+            && matches!(src, Source::Built { address, .. } if address.param == CODE)
+        {
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err("a buffer result");
+            };
+            for k in 0..count {
+                let d_off = self.s.m.i32(4 * k);
+                let a = self.s.m.bin(c, Bin::Add, off, d_off);
+                let x = self.code_dword(a)?;
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
+            return Ok(());
+        }
         let r = if typed {
             if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
                 return Err("a typed buffer load at an offset");

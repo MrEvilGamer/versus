@@ -26,7 +26,8 @@
 16. **Cycle 14 (`8d79b83`):** Implemented IEEE-754 `v_ldexp_f32` in `lower.rs` — **`v_ldexp_f32`: `2 → 0`**, **Total `WARN`: `633` (`29` categories), `host_created: 304`, `0` errors!**
 17. **Cycle 15 (`f91de1e`):** Implemented DPP source modifier support for `v_cmp_*`/`v_cmpx_*` in `lower.rs` — **`a compare with DPP`: `1 → 0`**, **Total `WARN`: `631` (`28` categories), `host_created: 305`, `0` errors!**
 18. **Cycle 16 (`264d134`):** Added trailing SM 6.6 `ResourceHeap`/`SamplerHeap` user SGPRs (`COMPUTE_PGM_RSRC2.USER_SGPR`) to `fspx_program()` in `native.rs` — **`a descriptor outside the heaps`: `219 → 10` (`-209`)**, **`104` shaders fully restored (`609 → 505`), `host_created: 305 → 375` (`+70`), `executed: 4 → 7`!**
-19. **Cycle 17:** Added `s_add_u32(..., src_scc)` carry recognition to `high_half()` in `resource.rs` — **`an address with an untracked high half`: `148 → 2` (`-146`)**, **`host_created: 375 → 385` (`+220` total since `1dfee4a`), Total `WARN`: `545` (`-61%` from `1,392` baseline)!**
+19. **Cycle 17 (`724bc53`):** Added `s_add_u32(..., src_scc)` carry recognition to `high_half()` in `resource.rs` — **`an address with an untracked high half`: `148 → 2` (`-146`)**, **`host_created: 375 → 385` (`+220` total since `1dfee4a`), Total `WARN`: `545` (`-61%` from `1,392` baseline)!**
+20. **Cycle 18:** Added `Source::Built { address, .. } if address.param == CODE` support for `buffer_load_dword*` in `lower.rs` — **`a descriptor built around a table in the code`: `24 → 0` (18th category eliminated!)**, **`35` shaders restored (`521 → 486`), `host_created: 385 → 409` (`+24`, `+244` total since `1dfee4a`), Total `WARN`: `545 → 511` (`-63%` from `1,392` baseline)!**
 
 ## Remaining Top Shader Failure Categories (Baseline `ae08fb7`)
 | Unique Shaders | Category |
