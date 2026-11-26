@@ -1162,6 +1162,23 @@ pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
     result
 }
 
+/// Milestone 6: Live NVIDIA Wave32 vs Wave64 shader classification counters:
+/// `[0] = Class A (wave-independent native Wave32), [1] = Class B (provably Wave32-compatible), [2] = Class C (selective Wave64 lowering)`.
+static WAVE_CLASSES: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Returns `(class_a_native, class_b_wave32_compat, class_c_selective_wave64)`.
+pub fn wave_class_stats() -> (u64, u64, u64) {
+    (
+        WAVE_CLASSES[0].load(std::sync::atomic::Ordering::Relaxed),
+        WAVE_CLASSES[1].load(std::sync::atomic::Ordering::Relaxed),
+        WAVE_CLASSES[2].load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 pub(super) fn host_max_wave() -> u32 {
     #[cfg(test)]
     if let Some(lanes) = TEST_HOST_WAVE.get() {
@@ -1462,8 +1479,10 @@ impl<'a> Lower<'a> {
                 }) || lane_constant_masks(x.st)
                     || !x.st.wide.is_empty();
                 if !crosses && (s.lds_dwords == 0 || group <= 32) {
+                    WAVE_CLASSES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     wave = 32;
                 } else {
+                    WAVE_CLASSES[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     // (Groups of several console waves too: each console wave is two host
                     // waves, which exchange through their own pair of dwords.)
                     // LDS the console shares within its one wave without barriers: split into
