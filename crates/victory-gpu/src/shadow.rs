@@ -70,7 +70,7 @@ pub(crate) struct Shadow {
     /// With snapshots kept ([`keeps`]): which 64 KiB pieces of the snapshot
     /// hold the copy's bytes as they are now, and whether the snapshot is
     /// counted in [`KEPT_BYTES`].
-    kept: Mutex<(Vec<bool>, bool)>,
+    kept: Arc<Mutex<(Vec<bool>, bool)>>,
     /// When the copy was last asked for (`crate::host::moment`): a window
     /// outside buffers nothing asked for in a while, and nothing holds, is
     /// let go ([`let_go_idle`]).
@@ -1661,6 +1661,8 @@ static SNAP_TELEMETRY: [AtomicU64; 5] = [
 ];
 static SNAP_BATCHES: AtomicU64 = AtomicU64::new(0);
 static SNAP_REUSED_BATCHES: AtomicU64 = AtomicU64::new(0);
+/// Deferred retained snapshot pieces marked reusable only after `take_snapshots()` completes.
+static PENDING_KEPT: Mutex<Vec<(Arc<Mutex<(Vec<bool>, bool)>>, usize)>> = Mutex::new(Vec::new());
 
 fn verify_kept_snapshots() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1704,6 +1706,13 @@ pub(crate) fn take_snapshots() {
             let ns = started.elapsed().as_nanos() as u64;
             SNAP_TELEMETRY[2].fetch_add(total_bytes as u64, Ordering::Relaxed);
             SNAP_TELEMETRY[3].fetch_add(ns, Ordering::Relaxed);
+        }
+    }
+    let ready = std::mem::take(&mut *PENDING_KEPT.lock().unwrap_or_else(|e| e.into_inner()));
+    for (kept, piece) in ready {
+        let mut g = kept.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = g.0.get_mut(piece) {
+            *slot = true;
         }
     }
     if n % 120 == 0 {
@@ -2730,7 +2739,7 @@ impl Drop for Shadow {
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
-        if self.kept.get_mut().unwrap_or_else(|e| e.into_inner()).1 {
+        if self.kept.lock().unwrap_or_else(|e| e.into_inner()).1 {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
         let window = self.window;
@@ -3328,7 +3337,7 @@ impl Shadow {
             flights: Mutex::default(),
             before: Mutex::default(),
             merging: RwLock::default(),
-            kept: Mutex::default(),
+            kept: Arc::new(Mutex::default()),
             used: AtomicU64::new(crate::host::moment()),
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
             unsized_asks: AtomicU64::new(0),
@@ -3452,21 +3461,33 @@ impl Shadow {
                     let (lo, hi) = (lo.max(from), hi.min(to));
                     let len = hi - lo;
                     if kept.0[piece] {
-                        SNAP_TELEMETRY[1].fetch_add(len as u64, Ordering::Relaxed);
+                        let mut valid = true;
                         if verify {
                             // SAFETY: `lo..hi` lies within both `self.data` and `snapshot`.
                             let live = unsafe { std::slice::from_raw_parts(self.data.add(lo), len) };
                             let saved = unsafe { std::slice::from_raw_parts(snapshot.as_ptr().add(lo), len) };
                             if live != saved {
                                 SNAP_TELEMETRY[4].fetch_add(1, Ordering::Relaxed);
+                                kept.0[piece] = false;
+                                valid = false;
                             }
                         }
-                        continue;
+                        if valid {
+                            SNAP_TELEMETRY[1].fetch_add(len as u64, Ordering::Relaxed);
+                            continue;
+                        }
                     }
                     if defer {
                         // SAFETY: `lo..hi` lies within `self.data` and `snapshot` (capacity >= total).
                         unsafe {
                             deferred.push((self.data.add(lo) as usize, snapshot.as_mut_ptr().add(lo) as usize, len));
+                        }
+                        // Only mark reusable once `take_snapshots()` finishes copying.
+                        if whole {
+                            PENDING_KEPT
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push((Arc::clone(&self.kept), piece));
                         }
                     } else {
                         let started = std::time::Instant::now();
@@ -3476,8 +3497,8 @@ impl Shadow {
                         }
                         SNAP_TELEMETRY[2].fetch_add(len as u64, Ordering::Relaxed);
                         SNAP_TELEMETRY[3].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        kept.0[piece] = whole;
                     }
-                    kept.0[piece] = whole;
                 }
             }
             if !deferred.is_empty() {
