@@ -27,6 +27,8 @@ static LAST_EVICT_CANDIDATES: AtomicU64 = AtomicU64::new(0);
 static CPU_WRITE_EVENTS: AtomicU64 = AtomicU64::new(0);
 static GPU_WRITE_EVENTS: AtomicU64 = AtomicU64::new(0);
 static READONLY_HASH_SKIPS: AtomicU64 = AtomicU64::new(0);
+static EVICTED_BUFFERS: AtomicU64 = AtomicU64::new(0);
+static EVICTED_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Whether GGVL tracking is active (`VICTORY_GGVL=0` disables it).
 pub(crate) fn enabled() -> bool {
@@ -59,6 +61,8 @@ pub(crate) fn on_vram_budget(budget_bytes: u64, usage_bytes: u64) {
                 gpu_writes = GPU_WRITE_EVENTS.load(Ordering::Relaxed),
                 readonly_hash_skips = READONLY_HASH_SKIPS.load(Ordering::Relaxed),
                 evict_candidates = evict.len(),
+                evicted_buffers = EVICTED_BUFFERS.load(Ordering::Relaxed),
+                evicted_mb = EVICTED_BYTES.load(Ordering::Relaxed) / (1024 * 1024),
                 "ggvl: live residency & coherency status"
             );
         }
@@ -105,6 +109,38 @@ pub(crate) fn on_graphics_fence_complete(completed: u64) {
     let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
     st.coherency.completed_deps.graphics =
         st.coherency.completed_deps.graphics.max(completed);
+}
+
+/// Returns true if all GGVL queue fence dependencies on `guest_addr..guest_addr+len`
+/// are satisfied by `completed_deps`, meaning eviction is fence-safe.
+pub(crate) fn is_fence_safe(guest_addr: u64, len: u64) -> bool {
+    if !enabled() || len == 0 {
+        return true;
+    }
+    let st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(ids) = st.coherency.page_table.overlapping(guest_addr, len) else {
+        return false;
+    };
+    ids.iter().all(|id| {
+        st.coherency
+            .resources
+            .get(id)
+            .is_none_or(|r| r.active_deps.is_satisfied_by(st.coherency.completed_deps))
+    })
+}
+
+/// Records an actual VRAM eviction of a cold buffer (marks nonresident until restored).
+pub(crate) fn note_evicted(guest_addr: u64, len: u64) {
+    EVICTED_BUFFERS.fetch_add(1, Ordering::Relaxed);
+    EVICTED_BYTES.fetch_add(len, Ordering::Relaxed);
+    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Ok(ids) = st.coherency.page_table.overlapping(guest_addr, len) {
+        for id in ids {
+            if let Some(res) = st.coherency.resources.get_mut(&id) {
+                res.resident_in_vram = false;
+            }
+        }
+    }
 }
 
 /// Records a live CPU->GPU dirty upload range from `host.rs`.

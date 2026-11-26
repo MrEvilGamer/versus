@@ -3046,6 +3046,38 @@ pub(crate) fn let_go_idle() {
         // submission is running after all.
         crate::host::retire(shadow);
     }
+    // Milestone 4: Actual fence-safe VRAM eviction of cold registered buffers under DXGI pressure.
+    if crate::ggvl_bridge::vram_under_pressure() {
+        let mut evicted: Vec<Arc<Shadow>> = Vec::new();
+        {
+            let mut map = buffers();
+            for entry in map.values_mut() {
+                if let Some(s) = entry.shadow.as_ref()
+                    && Arc::strong_count(s) == 1
+                    && crate::host::references(&s.buffer) == 1
+                    && !s.landing.load(Ordering::Relaxed)
+                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), 2_000, IDLE_FRAMES)
+                    && crate::ggvl_bridge::is_fence_safe(s.start, s.len)
+                {
+                    if let Some(shadow) = entry.shadow.take() {
+                        crate::ggvl_bridge::note_evicted(shadow.start, shadow.len);
+                        evicted.push(shadow);
+                    }
+                }
+            }
+        }
+        if !evicted.is_empty() {
+            let bytes: u64 = evicted.iter().map(|s| s.len).sum();
+            tracing::info!(
+                count = evicted.len(),
+                reclaimed_mb = bytes / (1024 * 1024),
+                "ggvl: evicted cold VRAM shadow buffers (fence-safe, on-demand restorable)"
+            );
+            for shadow in evicted {
+                crate::host::retire(shadow);
+            }
+        }
+    }
 }
 
 /// For the memory line: host copies alive and their bytes, of them the
