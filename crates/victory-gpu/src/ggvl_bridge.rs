@@ -5,12 +5,16 @@ use std::sync::{LazyLock, Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use versus_backend::ggvl::{
-    GgvlError, PageState, QueueDeps, ResidencyManager, ResidencyPriority, ResourceCoherencyManager, SyncPlan,
+    AdaptiveVramController, AllocationId, AllocationKind, AllocationRegistry, BackingStorageId,
+    GgvlError, MemorySegment, OwnershipState, PageState, QueueDeps, ReclaimTier, ResidencyManager,
+    ResidencyPriority, ResourceCoherencyManager, SyncPlan, TrackedAllocation,
 };
 
 struct GgvlState {
     coherency: ResourceCoherencyManager,
     residency: ResidencyManager,
+    registry: AllocationRegistry,
+    controller: AdaptiveVramController,
     by_title_buf: HashMap<(u64, usize), u64>,
     pending_unregister: HashSet<u64>,
 }
@@ -20,6 +24,8 @@ impl GgvlState {
         Self {
             coherency: ResourceCoherencyManager::default(),
             residency: ResidencyManager::new(6 * 1024 * 1024 * 1024),
+            registry: AllocationRegistry::new(),
+            controller: AdaptiveVramController::new(6 * 1024 * 1024 * 1024, 128 << 20),
             by_title_buf: HashMap::new(),
             pending_unregister: HashSet::new(),
         }
@@ -29,6 +35,7 @@ impl GgvlState {
         match self.coherency.unregister(id) {
             Ok(()) | Err(GgvlError::UnknownResource(_)) => {
                 self.pending_unregister.remove(&id);
+                self.registry.unregister(AllocationId(id));
             }
             Err(_) => {
                 self.pending_unregister.insert(id);
@@ -43,6 +50,23 @@ impl GgvlState {
         }
         if let Ok(id) = self.coherency.register(key.0, len, false, priority) {
             self.by_title_buf.insert(key, id);
+            self.registry.register(TrackedAllocation {
+                id: AllocationId(id),
+                backing_id: BackingStorageId(key.0),
+                kind: AllocationKind::ShadowBuffer,
+                size_bytes: len,
+                segment: MemorySegment::LocalVram,
+                last_access_frame: 0,
+                access_frequency: 1,
+                ownership: OwnershipState::CpuAuthoritative,
+                descriptor_refs: 0,
+                generation: 1,
+                active_deps: QueueDeps::default(),
+                restoration_cost: 20,
+                evictable: priority < ResidencyPriority::Critical,
+                resident: true,
+                reclaim_tier: Some(ReclaimTier::ColdShadowBuffer),
+            });
         }
     }
 
@@ -116,6 +140,50 @@ static GPU_WRITE_EVENTS: AtomicU64 = AtomicU64::new(0);
 static READONLY_HASH_SKIPS: AtomicU64 = AtomicU64::new(0);
 static EVICTED_BUFFERS: AtomicU64 = AtomicU64::new(0);
 static EVICTED_BYTES: AtomicU64 = AtomicU64::new(0);
+static LAST_BUDGET_BYTES: AtomicU64 = AtomicU64::new(0);
+static LAST_USAGE_BYTES: AtomicU64 = AtomicU64::new(0);
+static RECLAIM_REQUIRED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn vram_snapshot_mb() -> (u64, u64) {
+    (
+        LAST_BUDGET_BYTES.load(Ordering::Relaxed) >> 20,
+        LAST_USAGE_BYTES.load(Ordering::Relaxed) >> 20,
+    )
+}
+
+pub(crate) fn register_texture_heap(heap_id: u64, size_bytes: u64) {
+    if !enabled() {
+        return;
+    }
+    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let id = 0x8000_0000_0000_0000u64 | heap_id;
+    st.registry.register(TrackedAllocation {
+        id: AllocationId(id),
+        backing_id: BackingStorageId(id),
+        kind: AllocationKind::TextureHeap,
+        size_bytes,
+        segment: MemorySegment::LocalVram,
+        last_access_frame: 0,
+        access_frequency: 1,
+        ownership: OwnershipState::Coherent,
+        descriptor_refs: 0,
+        generation: 1,
+        active_deps: QueueDeps::default(),
+        restoration_cost: 0,
+        evictable: true,
+        resident: true,
+        reclaim_tier: Some(ReclaimTier::EmptyHeap),
+    });
+}
+
+pub(crate) fn unregister_texture_heap(heap_id: u64) {
+    if !enabled() {
+        return;
+    }
+    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let id = 0x8000_0000_0000_0000u64 | heap_id;
+    st.registry.unregister(AllocationId(id));
+}
 
 /// Whether GGVL tracking is active (`VICTORY_GGVL=0` disables it).
 pub(crate) fn enabled() -> bool {
@@ -158,22 +226,33 @@ pub(crate) fn on_vram_budget(budget_bytes: u64, usage_bytes: u64) {
         VRAM_PRESSURE.store(pressure, Ordering::Relaxed);
         if budget_bytes != 0 {
             st.residency.update_budget(budget_bytes, usage_bytes);
+            st.controller.update(budget_bytes, usage_bytes);
+            LAST_BUDGET_BYTES.store(budget_bytes, Ordering::Relaxed);
+            LAST_USAGE_BYTES.store(usage_bytes, Ordering::Relaxed);
+            RECLAIM_REQUIRED_BYTES.store(st.controller.reclamation_required_bytes(), Ordering::Relaxed);
         }
         if n > 0 && n % 200 == 0 {
             // The sorted candidate list is telemetry only. Do not rebuild it
             // on every budget query; reclamation uses the independent pressure bit.
             let evict = st.residency.select_evictions(&st.coherency);
+            let tracked_backing_mb = st.registry.total_unique_backing_bytes() >> 20;
+            let reclaim_req_mb = st.controller.reclamation_required_bytes() >> 20;
+            let usage_mb = usage_bytes >> 20;
+            let unaccounted_mb = usage_mb.saturating_sub(tracked_backing_mb);
             tracing::info!(
                 pressure,
-                budget_mb = budget_bytes / (1024 * 1024),
-                usage_mb = usage_bytes / (1024 * 1024),
+                budget_mb = budget_bytes >> 20,
+                usage_mb,
+                tracked_backing_mb,
+                unaccounted_mb,
+                reclaim_req_mb,
                 tracked = st.coherency.resources.len(),
                 cpu_writes = CPU_WRITE_EVENTS.load(Ordering::Relaxed),
                 gpu_writes = GPU_WRITE_EVENTS.load(Ordering::Relaxed),
                 readonly_hash_skips = READONLY_HASH_SKIPS.load(Ordering::Relaxed),
                 evict_candidates = evict.len(),
                 evicted_buffers = EVICTED_BUFFERS.load(Ordering::Relaxed),
-                evicted_mb = EVICTED_BYTES.load(Ordering::Relaxed) / (1024 * 1024),
+                evicted_mb = EVICTED_BYTES.load(Ordering::Relaxed) >> 20,
                 "ggvl: live residency & coherency status"
             );
         }

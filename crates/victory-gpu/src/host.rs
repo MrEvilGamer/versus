@@ -8981,6 +8981,20 @@ impl Meter {
                     placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                     objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
                 );
+                if let Some(csv_path) = std::env::var_os("VICTORY_FRAME_CSV") {
+                    use std::io::Write;
+                    let (vram_budget_mb, vram_usage_mb) = crate::ggvl_bridge::vram_snapshot_mb();
+                    let new_file = !std::path::Path::new(&csv_path).exists();
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&csv_path) {
+                        if new_file {
+                            let _ = writeln!(f, "ms,fps,cpu_ms,copy_ms,tex_ms,gpu_ms,rb_ms,draws,vram_budget_mb,vram_usage_mb");
+                        }
+                        let _ = writeln!(
+                            f,
+                            "{ms:.2},{fps:.2},{cpu:.2},{copy_ms:.2},{texture_ms:.2},{gpu:.2},{back_ms:.2},{draws:.0},{vram_budget_mb},{vram_usage_mb}"
+                        );
+                    }
+                }
                 #[cfg(feature = "diagnostics")]
                 {
                     let put = [0, 1, 2, 3].map(|i| crate::shadow::PUT[i].swap(0, Ordering::Relaxed) as f64 / frames);

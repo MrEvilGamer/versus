@@ -75,6 +75,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
             "ggvl: reclaimed empty texture pool VRAM heaps via fence-safe retirement"
         );
         for heap in reclaimed {
+            crate::ggvl_bridge::unregister_texture_heap(heap.as_raw() as usize as u64);
             crate::host::retire(heap);
         }
     }
