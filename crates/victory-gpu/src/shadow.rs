@@ -3144,30 +3144,31 @@ pub(crate) fn let_go_idle() {
         // under the same lock, so none is handed out in between.
         let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         if map.is_empty() {
-            return;
-        }
-        let mut eligible: Vec<(u64, (u64, u64), usize, u64)> = map
-            .iter()
-            .filter(|(_, s)| {
-                Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
-                    && crate::host::references(&s.buffer) == 1
-            })
-            .map(|(&key, s)| {
-                (s.used.load(Ordering::Relaxed), key, Arc::as_ptr(s) as usize, s.len)
-            })
-            .collect();
-        eligible.sort_unstable_by_key(|&(used, _, _, _)| used);
-        let victims = if keep == u64::MAX {
-            (0..eligible.len()).collect()
+            Vec::new()
         } else {
-            let entries: Vec<(u64, u64, usize)> = eligible
+            let mut eligible: Vec<(u64, (u64, u64), usize, u64)> = map
                 .iter()
-                .map(|&(used, _, id, len)| (used, len, id))
+                .filter(|(_, s)| {
+                    Arc::strong_count(s) == 1
+                        && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
+                        && crate::host::references(&s.buffer) == 1
+                })
+                .map(|(&key, s)| {
+                    (s.used.load(Ordering::Relaxed), key, Arc::as_ptr(s) as usize, s.len)
+                })
                 .collect();
-            window_victims(&entries, keep)
-        };
-        victims.into_iter().filter_map(|i| map.remove(&eligible[i].1)).collect()
+            eligible.sort_unstable_by_key(|&(used, _, _, _)| used);
+            let victims = if keep == u64::MAX {
+                (0..eligible.len()).collect()
+            } else {
+                let entries: Vec<(u64, u64, usize)> = eligible
+                    .iter()
+                    .map(|&(used, _, id, len)| (used, len, id))
+                    .collect();
+                window_victims(&entries, keep)
+            };
+            victims.into_iter().filter_map(|i| map.remove(&eligible[i].1)).collect()
+        }
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());

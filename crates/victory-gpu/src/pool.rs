@@ -50,7 +50,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
     };
     SPARES.store(keep, Ordering::Relaxed);
     let (_, finished) = crate::host::submissions();
-    let (reclaimed, draining_count, stats): (Vec<ID3D12Heap>, usize, PoolStats) = {
+    let (reclaimed, draining_count, stats): (Vec<(ID3D12Heap, u64)>, usize, PoolStats) = {
         let mut pool = TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
         let reclaimed = pool.reclaim_empty(keep, finished, now());
         let draining_count = if under_pressure {
@@ -63,7 +63,12 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         (reclaimed, draining_count, stats)
     };
     if !reclaimed.is_empty() || draining_count > 0 {
-        let mb = (reclaimed.len() as u64 * BLOCK) / (1024 * 1024);
+        let mut released_bytes = 0u64;
+        for (heap, backing_id) in &reclaimed {
+            released_bytes += crate::ggvl_bridge::unregister_texture_heap(*backing_id);
+            crate::host::retire(heap.clone());
+        }
+        let mb = released_bytes / (1024 * 1024);
         tracing::info!(
             heaps = reclaimed.len(),
             reclaimed_mb = mb,
@@ -74,10 +79,6 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
             fragmented_mb = stats.fragmented_free_bytes >> 20,
             "ggvl: reclaimed empty texture pool VRAM heaps via fence-safe retirement"
         );
-        for heap in reclaimed {
-            crate::ggvl_bridge::unregister_texture_heap(heap.as_raw() as usize as u64, BLOCK);
-            crate::host::retire(heap);
-        }
     }
 }
 
@@ -470,7 +471,7 @@ struct Upload(ID3D12Resource, *mut u8);
 // SAFETY: the mapping is written by the owners of its pieces, each its own.
 unsafe impl Send for Upload {}
 
-static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT));
+static TEXTURES: Mutex<Pool<(ID3D12Heap, u64)>> = Mutex::new(Pool::new(SPARE_KEPT));
 static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT));
 
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
@@ -777,7 +778,7 @@ pub(crate) unsafe fn texture(
         return None;
     }
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-    let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
+    let (piece, (heap, _backing_id), again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: BLOCK,
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
@@ -795,10 +796,10 @@ pub(crate) unsafe fn texture(
             tracing::warn!(error = %e, "a block of texture memory is not resident");
             return None;
         }
-        if heap.is_some() {
-            let _ = crate::ggvl_bridge::register_texture_heap(BLOCK);
-        }
-        heap
+        heap.map(|h| {
+            let id = crate::ggvl_bridge::register_texture_heap(BLOCK);
+            (h, id)
+        })
     })?;
     let mut made: Option<ID3D12Resource> = None;
     // SAFETY: the piece is no one else's; the heap lives while a piece of

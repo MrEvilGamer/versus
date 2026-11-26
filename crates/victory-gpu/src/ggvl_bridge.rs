@@ -187,14 +187,23 @@ pub(crate) fn register_texture_heap(size_bytes: u64) -> u64 {
     heap_id
 }
 
-pub(crate) fn unregister_texture_heap(heap_id: u64, size_bytes: u64) {
+/// Unregisters a retired physical texture pool heap by its original monotonic ID.
+/// Derives released bytes from the removed registry record so double-unregister is a no-op.
+pub(crate) fn unregister_texture_heap(heap_id: u64) -> u64 {
     if !enabled() || heap_id == 0 {
-        return;
+        return 0;
     }
-    TEX_HEAP_BYTES.fetch_sub(size_bytes.min(TEX_HEAP_BYTES.load(Ordering::Relaxed)), Ordering::Relaxed);
     let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let id = 0x8000_0000_0000_0000u64 | heap_id;
-    st.registry.unregister(AllocationId(id));
+    if let Some(removed) = st.registry.unregister(AllocationId(id)) {
+        TEX_HEAP_BYTES.fetch_sub(
+            removed.size_bytes.min(TEX_HEAP_BYTES.load(Ordering::Relaxed)),
+            Ordering::Relaxed,
+        );
+        removed.size_bytes
+    } else {
+        0
+    }
 }
 
 /// Whether GGVL tracking is active (`VICTORY_GGVL=0` disables it).
