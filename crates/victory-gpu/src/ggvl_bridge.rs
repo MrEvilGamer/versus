@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex, OnceLock};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use versus_backend::ggvl::{
     GgvlError, QueueDeps, ResidencyManager, ResidencyPriority, ResourceCoherencyManager, SyncPlan,
@@ -23,7 +23,7 @@ static STATE: LazyLock<Mutex<GgvlState>> = LazyLock::new(|| {
 });
 
 static BUDGET_UPDATES: AtomicU64 = AtomicU64::new(0);
-static LAST_EVICT_CANDIDATES: AtomicU64 = AtomicU64::new(0);
+static VRAM_PRESSURE: AtomicBool = AtomicBool::new(false);
 static CPU_WRITE_EVENTS: AtomicU64 = AtomicU64::new(0);
 static GPU_WRITE_EVENTS: AtomicU64 = AtomicU64::new(0);
 static READONLY_HASH_SKIPS: AtomicU64 = AtomicU64::new(0);
@@ -42,6 +42,18 @@ pub(crate) fn skip_readonly_hash() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_GGVL_SKIP_READONLY_HASH").is_some_and(|v| v == "1"))
 }
 
+/// Pressure follows the budget, not the number of eligible shadow buffers.
+/// Empty texture heaps can be reclaimed even when every shadow is in flight.
+/// Retain the previous state on an invalid (zero-budget) sample.
+fn pressure_after_sample(previous: bool, budget: u64, usage: u64, high: u64, low: u64) -> bool {
+    if budget == 0 {
+        return previous;
+    }
+    let used = u128::from(usage) * 100;
+    let threshold = u128::from(budget) * u128::from(if previous { low } else { high });
+    used > threshold
+}
+
 /// Feeds live `IDXGIAdapter3::QueryVideoMemoryInfo` local budget & usage into `ResidencyManager`.
 pub(crate) fn on_vram_budget(budget_bytes: u64, usage_bytes: u64) {
     if !enabled() {
@@ -49,11 +61,23 @@ pub(crate) fn on_vram_budget(budget_bytes: u64, usage_bytes: u64) {
     }
     let n = BUDGET_UPDATES.fetch_add(1, Ordering::Relaxed);
     if let Ok(mut st) = STATE.lock() {
-        st.residency.update_budget(budget_bytes, usage_bytes);
-        let evict = st.residency.select_evictions(&st.coherency);
-        LAST_EVICT_CANDIDATES.store(evict.len() as u64, Ordering::Relaxed);
+        let pressure = pressure_after_sample(
+            VRAM_PRESSURE.load(Ordering::Relaxed),
+            budget_bytes,
+            usage_bytes,
+            st.residency.high_watermark_pct,
+            st.residency.low_watermark_pct,
+        );
+        VRAM_PRESSURE.store(pressure, Ordering::Relaxed);
+        if budget_bytes != 0 {
+            st.residency.update_budget(budget_bytes, usage_bytes);
+        }
         if n > 0 && n % 200 == 0 {
+            // The sorted candidate list is telemetry only. Do not rebuild it
+            // on every budget query; reclamation uses the independent pressure bit.
+            let evict = st.residency.select_evictions(&st.coherency);
             tracing::info!(
+                pressure,
                 budget_mb = budget_bytes / (1024 * 1024),
                 usage_mb = usage_bytes / (1024 * 1024),
                 tracked = st.coherency.resources.len(),
@@ -96,9 +120,10 @@ pub(crate) fn on_buffer_unregister(resource: usize, start: u64) {
     }
 }
 
-/// Returns true when live DXGI VRAM usage exceeds `ResidencyManager`'s high watermark (92%).
+/// Enters pressure above the high watermark (92%), exits at or below the low
+/// watermark (82%), independently of whether shadow eviction is possible.
 pub(crate) fn vram_under_pressure() -> bool {
-    enabled() && LAST_EVICT_CANDIDATES.load(Ordering::Relaxed) > 0
+    enabled() && VRAM_PRESSURE.load(Ordering::Relaxed)
 }
 
 /// Advances the completed graphics fence so fence-safe eviction & deferred destruction stay exact.
@@ -249,4 +274,28 @@ pub(crate) fn plan_gpu_read(id: u64, addr: u64, len: u64, frame: u64) -> Result<
         .map_err(|_| GgvlError::UnknownResource(id))?
         .coherency
         .plan_gpu_read(id, addr, len, frame)
+}
+
+#[cfg(test)]
+mod pressure_tests {
+    use super::pressure_after_sample;
+
+    #[test]
+    fn pressure_uses_hysteresis_without_candidates() {
+        assert!(!pressure_after_sample(false, 100, 92, 92, 82));
+        assert!(pressure_after_sample(false, 100, 93, 92, 82));
+        assert!(pressure_after_sample(true, 100, 90, 92, 82));
+        assert!(pressure_after_sample(true, 100, 83, 92, 82));
+        assert!(!pressure_after_sample(true, 100, 82, 92, 82));
+        assert!(!pressure_after_sample(false, 100, 90, 92, 82));
+    }
+
+    #[test]
+    fn pressure_handles_budget_changes_and_invalid_samples() {
+        assert!(pressure_after_sample(false, 80, 80, 92, 82));
+        assert!(!pressure_after_sample(true, 100, 80, 92, 82));
+        assert!(pressure_after_sample(true, 0, 0, 92, 82));
+        assert!(!pressure_after_sample(false, 0, u64::MAX, 92, 82));
+        assert!(pressure_after_sample(false, u64::MAX, u64::MAX, 92, 82));
+    }
 }
