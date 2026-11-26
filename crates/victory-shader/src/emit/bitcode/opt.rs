@@ -541,6 +541,69 @@ impl Module {
                     (Bin::Or, _, Some(m)) if m == all => Some(b),
                     (Bin::Or, Some(m), _) if m == all => Some(a),
                     (Bin::And | Bin::Or, _, _) if a == b => Some(a),
+                    // Mesa NIR algebraic identities: x - x = 0, x ^ x = 0, x % 1 = 0.
+                    (Bin::Sub | Bin::Xor, _, _) if a == b => Some(self.k(ty, bits, 0)),
+                    (Bin::URem, _, Some(1)) => Some(self.k(ty, bits, 0)),
+                    // Mesa NIR strength reduction: udiv/urem by power of 2 -> lshr/and.
+                    (Bin::UDiv, _, Some(y)) if y.is_power_of_two() && y > 1 => {
+                        let sh = self.k(ty, bits, u64::from(y.trailing_zeros()));
+                        self.insts[i as usize].op = Op::Bin(Bin::LShr, a, sh);
+                        *changed = true;
+                        None
+                    }
+                    (Bin::URem, _, Some(y)) if y.is_power_of_two() && y > 1 => {
+                        let m = self.k(ty, bits, y - 1);
+                        self.insts[i as usize].op = Op::Bin(Bin::And, a, m);
+                        *changed = true;
+                        None
+                    }
+                    // Mesa NIR associative constant reassociation: (x op c1) op c2 -> x op (c1 op c2).
+                    (Bin::Add | Bin::And | Bin::Or | Bin::Xor, None, Some(c2)) => {
+                        if let V::Inst(ai) = a
+                            && let Op::Bin(op1, x, y) = self.insts[ai as usize].op
+                            && op1 == op
+                            && let Some((_, c1)) = self.int_k(y)
+                        {
+                            let combined = match op {
+                                Bin::Add => c1.wrapping_add(c2) & all,
+                                Bin::And => c1 & c2,
+                                Bin::Or => c1 | c2,
+                                Bin::Xor => c1 ^ c2,
+                                _ => unreachable!(),
+                            };
+                            if matches!(op, Bin::Add | Bin::Or | Bin::Xor) && combined == 0 {
+                                return Some(x);
+                            }
+                            if op == Bin::And && combined == 0 {
+                                return Some(self.k(ty, bits, 0));
+                            }
+                            if op == Bin::And && combined == all {
+                                return Some(x);
+                            }
+                            let ck = self.k(ty, bits, combined);
+                            self.insts[i as usize].op = Op::Bin(op, x, ck);
+                            *changed = true;
+                        }
+                        None
+                    }
+                    // Mesa NIR shift chaining: (x << s1) << s2 -> x << (s1 + s2), same for lshr.
+                    (Bin::Shl | Bin::LShr, None, Some(s2)) if s2 < u64::from(bits) => {
+                        if let V::Inst(ai) = a
+                            && let Op::Bin(op1, x, y) = self.insts[ai as usize].op
+                            && op1 == op
+                            && let Some((_, s1)) = self.int_k(y)
+                            && s1 < u64::from(bits)
+                        {
+                            let total = s1 + s2;
+                            if total >= u64::from(bits) {
+                                return Some(self.k(ty, bits, 0));
+                            }
+                            let sk = self.k(ty, bits, total);
+                            self.insts[i as usize].op = Op::Bin(op, x, sk);
+                            *changed = true;
+                        }
+                        None
+                    }
                     _ => None,
                 }
             }
