@@ -5055,6 +5055,30 @@ impl<'a> Lower<'a> {
         if self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
         }
+        if matches!(name, "ds_append" | "ds_consume") {
+            let reg = dst_reg.ok_or("a ds_append/ds_consume result")?;
+            let at = self.begin_guarded(guard);
+            let c = self.cur;
+            let byte_off = u32::from(*offset0) | (u32::from(*offset1) << 8);
+            let index = self.s.m.i32(byte_off >> 2);
+            let lds = self.s.lds();
+            let ptr = self.s.m.element(c, lds, index);
+            let one = self.s.m.i32(1);
+            let r = self.s.m.atomic(
+                c,
+                if name == "ds_append" {
+                    super::bitcode::Rmw::Add
+                } else {
+                    super::bitcode::Rmw::Sub
+                },
+                ptr,
+                one,
+            );
+            let zero = self.s.m.i32(0);
+            let out = self.end_guarded(at, &[(r, zero)])[0];
+            self.write(inst, Reg::V(reg), out, guard);
+            return Ok(());
+        }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
         // shortcut: LDS addresses are taken as dword-aligned and in bounds
         // (out-of-bounds console accesses read 0 and drop writes).
