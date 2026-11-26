@@ -5851,6 +5851,26 @@ impl<'a> Lower<'a> {
                     self.set(lo, Val::I32(r));
                     Ok(())
                 }
+                "s_flbit_i32_b64" => {
+                    // The highest set bit (counted from MSB: 0..63), -1 for none
+                    // (DXIL's firstbit_hi op 33 returns 0..31 from MSB, -1 for 0).
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let i32t = self.s.t.i32;
+                    let fa = self
+                        .s
+                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 33, &[a]);
+                    let fb = self
+                        .s
+                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 33, &[b]);
+                    let (z, k32) = (self.s.m.i32(0), self.s.m.i32(32));
+                    let fa32 = self.s.m.bin(c, Bin::Add, fa, k32);
+                    let none = self.s.m.cmp(c, pred::EQ, a, z);
+                    let fa = self.s.m.select(c, none, fa, fa32);
+                    let high = self.s.m.cmp(c, pred::NE, b, z);
+                    let r = self.s.m.select(c, high, fb, fa);
+                    self.set(lo, Val::I32(r));
+                    Ok(())
+                }
                 "s_and_b64" | "s_or_b64" | "s_xor_b64" | "s_andn2_b64" | "s_orn2_b64"
                 | "s_nand_b64" | "s_nor_b64" | "s_xnor_b64" | "s_not_b64" => {
                     let ones = self.s.m.i32(u32::MAX);
