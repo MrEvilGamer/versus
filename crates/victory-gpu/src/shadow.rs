@@ -1651,69 +1651,78 @@ static SNAPS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
 /// With [`wide_back`], when a submission's refreshes are done and before
 /// its lists go to the card: takes the snapshots [`Shadow::writing`] noted.
 /// Nothing to do without the switch.
-/// Snapshot telemetry: `[0] = requested_bytes, [1] = reused_bytes, [2] = copied_bytes, [3] = copy_ns`.
-static SNAP_TELEMETRY: [AtomicU64; 4] = [
+/// Snapshot telemetry: `[0] = requested_bytes, [1] = reused_bytes, [2] = copied_bytes, [3] = copy_ns, [4] = mismatches`.
+static SNAP_TELEMETRY: [AtomicU64; 5] = [
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
 ];
 static SNAP_BATCHES: AtomicU64 = AtomicU64::new(0);
+static SNAP_REUSED_BATCHES: AtomicU64 = AtomicU64::new(0);
+
+fn verify_kept_snapshots() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VERIFY_KEPT_SNAPSHOTS").is_some_and(|v| v == "1"))
+}
 
 pub(crate) fn take_snapshots() {
     let snaps = std::mem::take(&mut *SNAPS.lock().unwrap_or_else(|e| e.into_inner()));
-    if snaps.is_empty() {
-        return;
-    }
-    let total_bytes: usize = snaps.iter().map(|&(_, _, len)| len).sum();
-    if total_bytes == 0 {
-        return;
-    }
-    let started = std::time::Instant::now();
-    let threads = wide_threads() + 1;
-    // Adaptive chunk size: target ~4 chunks per worker thread, clamped to [64 KiB, 1 MiB].
-    let chunk_size = (total_bytes / (threads * 4)).clamp(64 << 10, WIDE_JOB);
-    let mut flat: Vec<(usize, usize, usize)> = Vec::with_capacity(snaps.len() + total_bytes / chunk_size);
-    for (src, dst, len) in snaps {
-        let mut at = 0;
-        while at < len {
-            let n = chunk_size.min(len - at);
-            flat.push((src + at, dst + at, n));
-            at += n;
-        }
-    }
-    let count = flat.len();
-    if count <= 1 || total_bytes < (64 << 10) {
-        for (src, dst, len) in flat {
-            // SAFETY: caller's non-overlapping host copy mapping and snapshot buffer.
-            unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
-        }
-    } else {
-        let flat = Arc::new(flat);
-        wide_each(count, move |i| {
-            let (src, dst, len) = flat[i];
-            // SAFETY: caller's non-overlapping host copy mapping and snapshot buffer.
-            unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
-        });
-    }
-    let ns = started.elapsed().as_nanos() as u64;
-    SNAP_TELEMETRY[0].fetch_add(total_bytes as u64, Ordering::Relaxed);
-    SNAP_TELEMETRY[2].fetch_add(total_bytes as u64, Ordering::Relaxed);
-    SNAP_TELEMETRY[3].fetch_add(ns, Ordering::Relaxed);
     let n = SNAP_BATCHES.fetch_add(1, Ordering::Relaxed) + 1;
+    if snaps.is_empty() {
+        SNAP_REUSED_BATCHES.fetch_add(1, Ordering::Relaxed);
+    } else {
+        let total_bytes: usize = snaps.iter().map(|&(_, _, len)| len).sum();
+        if total_bytes > 0 {
+            let started = std::time::Instant::now();
+            let threads = wide_threads() + 1;
+            let chunk_size = (total_bytes / (threads * 4)).clamp(64 << 10, WIDE_JOB);
+            let mut flat: Vec<(usize, usize, usize)> = Vec::with_capacity(snaps.len() + total_bytes / chunk_size);
+            for (src, dst, len) in snaps {
+                let mut at = 0;
+                while at < len {
+                    let n = chunk_size.min(len - at);
+                    flat.push((src + at, dst + at, n));
+                    at += n;
+                }
+            }
+            let count = flat.len();
+            if count <= 1 || total_bytes < (64 << 10) {
+                for (src, dst, len) in flat {
+                    // SAFETY: caller's non-overlapping host copy mapping and snapshot buffer.
+                    unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+                }
+            } else {
+                let flat = Arc::new(flat);
+                wide_each(count, move |i| {
+                    let (src, dst, len) = flat[i];
+                    // SAFETY: caller's non-overlapping host copy mapping and snapshot buffer.
+                    unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+                });
+            }
+            let ns = started.elapsed().as_nanos() as u64;
+            SNAP_TELEMETRY[2].fetch_add(total_bytes as u64, Ordering::Relaxed);
+            SNAP_TELEMETRY[3].fetch_add(ns, Ordering::Relaxed);
+        }
+    }
     if n % 120 == 0 {
         let req = SNAP_TELEMETRY[0].swap(0, Ordering::Relaxed);
         let reused = SNAP_TELEMETRY[1].swap(0, Ordering::Relaxed);
         let copied = SNAP_TELEMETRY[2].swap(0, Ordering::Relaxed);
         let copy_ns = SNAP_TELEMETRY[3].swap(0, Ordering::Relaxed).max(1);
+        let mismatches = SNAP_TELEMETRY[4].swap(0, Ordering::Relaxed);
+        let reused_batches = SNAP_REUSED_BATCHES.swap(0, Ordering::Relaxed);
         let gb_s = (copied as f64) / (copy_ns as f64);
         tracing::info!(
             batches = 120,
+            reused_batches,
             requested_mb = req >> 20,
             reused_mb = reused >> 20,
             copied_mb = copied >> 20,
             avg_copy_ms = (copy_ns as f64 / 1e6) / 120.0,
             bandwidth_gbs = format!("{gb_s:.2}"),
+            mismatches,
             "shadow: snapshot pipeline telemetry"
         );
     }
@@ -3420,37 +3429,59 @@ impl Shadow {
         pending.push(range);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
+        SNAP_TELEMETRY[0].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let snapshot = before.get_or_insert_with(|| pooled(total));
         if keeps() {
-            // Piece by piece, and only the pieces not known current. A
-            // piece the part holds whole is current from now on; of a
-            // piece it holds partly only the part's bytes are taken, as
-            // without the switch, and it is taken again next time (the
-            // rest of it may belong to a range declared earlier, whose
-            // bytes stay as they were taken).
+            // Piece by piece, and only the pieces not known current.
             let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
             if kept.0.is_empty() {
                 kept.0 = vec![false; self.pieces(0, total.max(1)).end];
             }
+            let verify = verify_kept_snapshots();
+            let defer = wide_back();
+            let mut deferred: Vec<(usize, usize, usize)> = Vec::new();
             for (from, to) in parts {
                 if from >= to {
                     continue;
                 }
                 for piece in self.pieces(from, to) {
-                    if kept.0[piece] {
-                        continue;
-                    }
                     let (lo, hi) = self.piece(piece);
                     let whole = from <= lo && hi <= to;
                     let (lo, hi) = (lo.max(from), hi.min(to));
-                    // SAFETY: as below; `hi <= total`.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
+                    let len = hi - lo;
+                    if kept.0[piece] {
+                        SNAP_TELEMETRY[1].fetch_add(len as u64, Ordering::Relaxed);
+                        if verify {
+                            // SAFETY: `lo..hi` lies within both `self.data` and `snapshot`.
+                            let live = unsafe { std::slice::from_raw_parts(self.data.add(lo), len) };
+                            let saved = unsafe { std::slice::from_raw_parts(snapshot.as_ptr().add(lo), len) };
+                            if live != saved {
+                                SNAP_TELEMETRY[4].fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        continue;
+                    }
+                    if defer {
+                        // SAFETY: `lo..hi` lies within `self.data` and `snapshot` (capacity >= total).
+                        unsafe {
+                            deferred.push((self.data.add(lo) as usize, snapshot.as_mut_ptr().add(lo) as usize, len));
+                        }
+                    } else {
+                        let started = std::time::Instant::now();
+                        // SAFETY: as below; `hi <= total`.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), len);
+                        }
+                        SNAP_TELEMETRY[2].fetch_add(len as u64, Ordering::Relaxed);
+                        SNAP_TELEMETRY[3].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     }
                     kept.0[piece] = whole;
                 }
+            }
+            if !deferred.is_empty() {
+                SNAPS.lock().unwrap_or_else(|e| e.into_inner()).extend(deferred);
             }
             return;
         }
