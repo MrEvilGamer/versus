@@ -4,6 +4,8 @@
 //! lookup-cache, and AVX2 defaults before the GPU layer reads its `OnceLock`
 //! configuration, while keeping every switch overridable via environment variables.
 
+pub mod ggvl;
+
 /// Active GPU backend target for Versus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
