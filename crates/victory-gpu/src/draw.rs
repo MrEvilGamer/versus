@@ -742,6 +742,24 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
 /// The pass over the buffer views of `heap` that shaders pick by index
 /// ([`State::heap_buffers`]): their host slots are made, and the host copies
 /// they show are to be refreshed.
+type Ranges = HeapRanges<std::sync::Arc<crate::shadow::Shadow>>;
+static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
+    std::sync::Mutex::new(None);
+
+/// Releases cached buffer-pass shadow references when a descriptor heap is dropped,
+/// preventing leaked GPU buffers and pointer-address reuse collisions.
+/// Adapted from fxceless/victory-fork#1276 (0e21fcf, UwUCammie).
+pub(crate) fn forget_heap_ranges(heap: &crate::descriptor::host::HostHeap) {
+    let key = std::ptr::from_ref(heap) as usize;
+    let ranges = RANGES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+        .and_then(|heaps| heaps.remove(&key));
+    // Dropping a shadow can release GPU resources. Keep that outside the lock.
+    drop(ranges);
+}
+
 fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::HostHeap, frame: u64) -> Vec<crate::host::aside::Refresh> {
     let started = std::time::Instant::now();
     // Per host heap: the host copy and range each slot's buffer view
@@ -750,9 +768,6 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     // at best); all of them every 16 passes, because a view of a
     // released resource goes stale without a write, and a slot written
     // before its memory had a host copy is only made then.
-    type Ranges = HeapRanges<std::sync::Arc<crate::shadow::Shadow>>;
-    static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
-        std::sync::Mutex::new(None);
     let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
     let (passes, ranges) = kept
         .get_or_insert_with(Default::default)
@@ -4485,5 +4500,37 @@ mod record_hash_tests {
         // (One record of zeros is among the above.)
         let zeros: Vec<u64> = (2..100).map(|n| of(&vec![[0; 3]; n])).collect();
         assert!(zeros.iter().all(|h| seen.insert(*h)));
+    }
+
+    #[test]
+    fn dropping_a_descriptor_heap_releases_buffer_pass_cache() {
+        use crate::descriptor::host::HostHeap;
+        use crate::resource::Memory;
+        use std::sync::Arc;
+
+        if crate::host::host().is_none() {
+            eprintln!("no host D3D12 device; skipped");
+            return;
+        }
+        let heap = Box::new(HostHeap::new(false, 4).expect("view heap"));
+        let key = std::ptr::from_ref(heap.as_ref()) as usize;
+        let memory = Memory::zeroed(4096, 4096).expect("test buffer");
+        let start = memory.address();
+        crate::shadow::register(start as usize, start, 4096);
+        let copy = crate::shadow::find(start, 4096).expect("host copy");
+        crate::shadow::unregister(start as usize, start);
+        let weak = Arc::downgrade(&copy);
+
+        let mut ranges = crate::draw::HeapRanges(Vec::new());
+        ranges.set(0, Some((copy.clone(), start, start + 4096)));
+        crate::draw::RANGES
+            .lock()
+            .unwrap()
+            .get_or_insert_with(Default::default)
+            .insert(key, (1, ranges));
+        drop(copy);
+        assert!(weak.upgrade().is_some());
+        drop(heap);
+        assert!(weak.upgrade().is_none(), "a freed descriptor heap still owns the buffer copy");
     }
 }
