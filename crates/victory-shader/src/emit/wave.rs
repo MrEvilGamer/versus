@@ -317,14 +317,60 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
         if inst.write(Reg::S(EXEC)).is_some() {
             // Constant lane sets (prefix sums); anything else ends what
             // the simulation can follow.
-            let lo = name
-                .starts_with("s_mov_b")
-                .then(|| constant(inst))
-                .flatten();
+            let lo = if name.starts_with("s_mov_b") {
+                constant(inst)
+            } else if name == "s_bfm_b64" || name == "s_bfm_b32" {
+                let Fields::Sop { src, .. } = &inst.fields else {
+                    return (vec, uni);
+                };
+                let op_u32 = |o: &Operand| match *o {
+                    Operand::Const(c @ 128..=208) => crate::resource::inline(c),
+                    Operand::Literal(v) => Some(v),
+                    _ => None,
+                };
+                let (Some(w), Some(o)) = (
+                    src.first().and_then(op_u32),
+                    src.get(1).and_then(op_u32),
+                ) else {
+                    return (vec, uni);
+                };
+                if name == "s_bfm_b64" {
+                    let bits = (w & 63) as u32;
+                    let off = (o & 63) as u32;
+                    let m = if bits == 0 { 0 } else { (1u64 << bits) - 1 };
+                    Some(m.wrapping_shl(off))
+                } else {
+                    let bits = (w & 31) as u32;
+                    let off = (o & 31) as u32;
+                    let m = if bits == 0 { 0 } else { (1u32 << bits) - 1 };
+                    Some(u64::from(m.wrapping_shl(off)))
+                }
+            } else if name == "s_bitreplicate_b64_b32" {
+                let Fields::Sop { src, .. } = &inst.fields else {
+                    return (vec, uni);
+                };
+                let op_u32 = |o: &Operand| match *o {
+                    Operand::Const(c @ 128..=208) => crate::resource::inline(c),
+                    Operand::Literal(v) => Some(v),
+                    _ => None,
+                };
+                let Some(v) = src.first().and_then(op_u32) else {
+                    return (vec, uni);
+                };
+                let mut m = 0u64;
+                for i in 0..32u32 {
+                    if (v >> i) & 1 != 0 {
+                        m |= 3u64 << (2 * i);
+                    }
+                }
+                Some(m)
+            } else {
+                None
+            };
             let Some(k) = lo else {
                 return (vec, uni);
             };
-            exec = (if name == "s_mov_b64" {
+            exec = (if name == "s_mov_b64" || name == "s_bfm_b64" || name == "s_bitreplicate_b64_b32" {
                 k
             } else {
                 (exec & !0xFFFF_FFFF) | (k & 0xFFFF_FFFF)
