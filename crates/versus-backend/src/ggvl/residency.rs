@@ -88,7 +88,6 @@ pub struct TrackedAllocation {
 #[derive(Debug, Default)]
 pub struct AllocationRegistry {
     allocations: BTreeMap<AllocationId, TrackedAllocation>,
-    backing_sizes: BTreeMap<BackingStorageId, (u64, u32)>,
 }
 
 impl AllocationRegistry {
@@ -97,20 +96,21 @@ impl AllocationRegistry {
     }
 
     pub fn register(&mut self, alloc: TrackedAllocation) {
-        let backing = alloc.backing_id;
-        let size = alloc.size_bytes;
-        if let Some(prev) = self.allocations.insert(alloc.id, alloc) {
-            self.dec_backing(prev.backing_id);
-        }
-        let entry = self.backing_sizes.entry(backing).or_insert((size, 0));
-        entry.0 = entry.0.max(size);
-        entry.1 += 1;
+        self.allocations.insert(alloc.id, alloc);
     }
 
     pub fn unregister(&mut self, id: AllocationId) -> Option<TrackedAllocation> {
-        let removed = self.allocations.remove(&id)?;
-        self.dec_backing(removed.backing_id);
-        Some(removed)
+        self.allocations.remove(&id)
+    }
+
+    // Derive backing groups from authoritative entries. In particular, get_mut
+    // may change backing IDs or sizes, so a separate cached index can go stale.
+    fn backing_groups(&self) -> BTreeMap<BackingStorageId, Vec<&TrackedAllocation>> {
+        let mut groups: BTreeMap<BackingStorageId, Vec<&TrackedAllocation>> = BTreeMap::new();
+        for allocation in self.allocations.values() {
+            groups.entry(allocation.backing_id).or_default().push(allocation);
+        }
+        groups
     }
 
     pub fn get(&self, id: AllocationId) -> Option<&TrackedAllocation> {
@@ -131,43 +131,45 @@ impl AllocationRegistry {
 
     /// Total unique physical bytes across all registered backing allocations.
     pub fn total_unique_backing_bytes(&self) -> u64 {
-        self.backing_sizes.values().map(|(sz, _)| *sz).sum()
+        self.backing_groups().values()
+            .map(|group| group.iter().map(|a| a.size_bytes).max().unwrap_or(0))
+            .fold(0u64, u64::saturating_add)
     }
 
     pub fn unique_backing_count(&self) -> usize {
-        self.backing_sizes.len()
+        self.backing_groups().len()
     }
 
     /// Plans batched residency for a submission: deduplicates unique backing IDs and
     /// returns non-resident backing allocations to `EnqueueMakeResident`.
-    /// When `has_bindless_or_indirect` is true, conservatively includes all resident-eligible
-    /// non-resident allocations that could be referenced indirectly.
+    /// When indirect addressing or an unknown ID makes the inventory incomplete,
+    /// conservatively includes every tracked non-resident backing.
     pub fn plan_submission_residency(
         &self,
         referenced: &[AllocationId],
         has_bindless_or_indirect: bool,
     ) -> Vec<BackingStorageId> {
-        let mut need = BTreeSet::new();
+        let mut referenced_backings = BTreeSet::new();
+        let mut conservative = has_bindless_or_indirect;
         for id in referenced {
-            if let Some(a) = self.allocations.get(id)
-                && !a.resident
-            {
-                need.insert(a.backing_id);
+            if let Some(a) = self.allocations.get(id) {
+                referenced_backings.insert(a.backing_id);
+            } else {
+                // An incomplete submission inventory cannot prove non-use.
+                conservative = true;
             }
         }
-        if has_bindless_or_indirect {
-            for a in self.allocations.values() {
-                if !a.resident && a.descriptor_refs > 0 {
-                    need.insert(a.backing_id);
-                }
-            }
-        }
-        need.into_iter().collect()
+        self.backing_groups().into_iter().filter_map(|(backing, group)| {
+            ((conservative || referenced_backings.contains(&backing))
+                && group.iter().any(|a| !a.resident))
+                .then_some(backing)
+        }).collect()
     }
 
     /// Selects fence-safe, ownership-safe eviction candidates in strict 4-tier order
     /// to meet `reclaim_bytes`. Never evicts GPU-authoritative, Unknown, non-evictable,
-    /// or GPU-in-flight allocations.
+    /// or GPU-in-flight allocations. Each returned ID represents a whole backing;
+    /// callers must revalidate the complete group at eviction time.
     pub fn select_adaptive_evictions(
         &self,
         reclaim_bytes: u64,
@@ -176,55 +178,44 @@ impl AllocationRegistry {
         if reclaim_bytes == 0 {
             return Vec::new();
         }
-        let mut eligible: Vec<&TrackedAllocation> = self
-            .allocations
-            .values()
-            .filter(|a| {
+        // An eviction is a backing-level operation. Every alias must be safe,
+        // including aliases not chosen as the representative allocation ID.
+        // Aggregate priority conservatively using the hardest-to-restore alias.
+        let mut eligible = Vec::new();
+        for group in self.backing_groups().into_values() {
+            if !group.iter().all(|a| {
                 a.resident
                     && a.evictable
                     && a.segment == MemorySegment::LocalVram
-                    && matches!(
-                        a.ownership,
-                        OwnershipState::CpuAuthoritative | OwnershipState::Coherent
-                    )
+                    && a.descriptor_refs == 0
+                    && matches!(a.ownership, OwnershipState::CpuAuthoritative | OwnershipState::Coherent)
                     && a.active_deps.is_satisfied_by(completed_deps)
                     && a.reclaim_tier.is_some()
-            })
-            .collect();
-
-        eligible.sort_by_key(|a| {
-            (
-                a.reclaim_tier.unwrap_or(ReclaimTier::ColdPageableHeap),
-                a.restoration_cost,
-                a.access_frequency,
-                a.last_access_frame,
-                Reverse(a.size_bytes),
-            )
-        });
-
-        let mut seen_backing = BTreeSet::new();
+            }) {
+                continue;
+            }
+            let size = group.iter().map(|a| a.size_bytes).max().unwrap_or(0);
+            let tier = group.iter().filter_map(|a| a.reclaim_tier).max().unwrap();
+            let cost = group.iter().map(|a| a.restoration_cost).max().unwrap();
+            let frequency = group.iter().map(|a| a.access_frequency).max().unwrap();
+            let last_access = group.iter().map(|a| a.last_access_frame).max().unwrap();
+            // BTreeMap iteration yields a deterministic representative.
+            let id = group[0].id;
+            eligible.push(((tier, cost, frequency, last_access, Reverse(size), id), size));
+        }
+        eligible.sort_unstable_by_key(|&(key, _)| key);
         let mut freed = 0u64;
         let mut out = Vec::new();
-        for a in eligible {
+        for ((_, _, _, _, _, id), size) in eligible {
             if freed >= reclaim_bytes {
                 break;
             }
-            if seen_backing.insert(a.backing_id) {
-                out.push(a.id);
-                freed = freed.saturating_add(a.size_bytes);
-            }
+            out.push(id);
+            freed = freed.saturating_add(size);
         }
         out
     }
 
-    fn dec_backing(&mut self, backing: BackingStorageId) {
-        if let Some((_, count)) = self.backing_sizes.get_mut(&backing) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                self.backing_sizes.remove(&backing);
-            }
-        }
-    }
 }
 
 /// Adaptive VRAM controller driven by live DXGI budget and usage.
@@ -246,17 +237,23 @@ impl AdaptiveVramController {
     }
 
     pub fn update(&mut self, budget_bytes: u64, usage_bytes: u64) {
-        self.budget_bytes = budget_bytes;
-        self.usage_bytes = usage_bytes;
+        // A failed/invalid DXGI sample must not imply the entire budget vanished.
+        if budget_bytes != 0 {
+            self.budget_bytes = budget_bytes;
+            self.usage_bytes = usage_bytes;
+        }
     }
 
     /// Target usage = 85% of current DXGI budget.
     pub fn target_usage_bytes(&self) -> u64 {
-        self.budget_bytes.saturating_mul(85) / 100
+        ((u128::from(self.budget_bytes) * 85) / 100) as u64
     }
 
     /// Bytes that must be reclaimed to reach target usage plus reserved headroom.
     pub fn reclamation_required_bytes(&self) -> u64 {
+        if self.budget_bytes == 0 {
+            return 0;
+        }
         let effective_target = self
             .target_usage_bytes()
             .saturating_sub(self.reserved_headroom_bytes);

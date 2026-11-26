@@ -85,7 +85,9 @@ impl ResourceCoherencyManager {
 
     pub fn unregister(&mut self, id: u64) -> Result<(), GgvlError> {
         let res = self.resources.get(&id).ok_or(GgvlError::UnknownResource(id))?;
-        if !res.active_deps.is_satisfied_by(self.completed_deps) {
+        if !res.active_deps.is_satisfied_by(self.completed_deps)
+            || self.tickets.values().any(|ticket| ticket.resource_id == id)
+        {
             return Err(GgvlError::InFlight(id));
         }
         let (addr, size) = (res.guest_addr, res.size);
@@ -176,6 +178,11 @@ impl ResourceCoherencyManager {
             return Err(GgvlError::NonResident(id));
         }
         let (first, last) = res.page_range(addr, len)?;
+        if self.tickets.values().any(|ticket| {
+            ticket.resource_id == id && ticket.pages.iter().any(|&(p, _, _)| (first..=last).contains(&p))
+        }) {
+            return Err(GgvlError::InFlight(id));
+        }
         res.last_access_frame = frame;
 
         let mut upload_pages = Vec::new();
@@ -208,7 +215,7 @@ impl ResourceCoherencyManager {
             let mut ranges: Vec<(u64, u64)> = Vec::new();
             for &(p, _, _) in &upload_pages {
                 let s = res.guest_addr + (p as u64) * GUEST_PAGE_SIZE;
-                let e = (s + GUEST_PAGE_SIZE).min(res.guest_addr + res.size);
+                let e = s.saturating_add(GUEST_PAGE_SIZE).min(res.guest_addr + res.size);
                 if let Some((_, last_e)) = ranges.last_mut()
                     && *last_e == s
                 {
@@ -261,6 +268,12 @@ impl ResourceCoherencyManager {
         let res = self.resources.get(&id).ok_or(GgvlError::UnknownResource(id))?;
         let (first, last) = res.page_range(addr, len)?;
 
+        if self.tickets.values().any(|ticket| {
+            ticket.resource_id == id && ticket.pages.iter().any(|&(p, _, _)| (first..=last).contains(&p))
+        }) {
+            return Err(GgvlError::InFlight(id));
+        }
+
         let mut download_pages = Vec::new();
         let mut wait_deps = QueueDeps::default();
 
@@ -282,7 +295,7 @@ impl ResourceCoherencyManager {
         let mut ranges: Vec<(u64, u64)> = Vec::new();
         for &(p, _, _) in &download_pages {
             let s = res.guest_addr + (p as u64) * GUEST_PAGE_SIZE;
-            let e = (s + GUEST_PAGE_SIZE).min(res.guest_addr + res.size);
+            let e = s.saturating_add(GUEST_PAGE_SIZE).min(res.guest_addr + res.size);
             if let Some((_, last_e)) = ranges.last_mut()
                 && *last_e == s
             {
@@ -317,8 +330,19 @@ impl ResourceCoherencyManager {
             .tickets
             .get_mut(&ticket_id)
             .ok_or(GgvlError::UnknownTicket(ticket_id))?;
+        if ticket.submitted_deps.is_some() {
+            return Err(GgvlError::InFlight(ticket.resource_id));
+        }
+        let res = self.resources.get_mut(&ticket.resource_id)
+            .ok_or(GgvlError::UnknownResource(ticket.resource_id))?;
+        let mut deps = deps;
+        for &(p, _, _) in &ticket.pages {
+            if let Some(pg) = res.pages.get(p) {
+                deps.merge(pg.last_gpu_deps);
+            }
+        }
         ticket.submitted_deps = Some(deps);
-        if let Some(res) = self.resources.get_mut(&ticket.resource_id) {
+        {
             res.active_deps.merge(deps);
             for &(p, exp_cpu, exp_gpu) in &ticket.pages {
                 if let Some(pg) = res.pages.get_mut(p)
@@ -339,6 +363,14 @@ impl ResourceCoherencyManager {
     /// Stage 3 (Complete): Marks pages `Coherent` ONLY if their generation still matches the
     /// snapshot captured at planning time (prevents losing concurrent CPU/GPU writes).
     pub fn complete_transfer(&mut self, ticket_id: u64) -> Result<usize, GgvlError> {
+        // Keep the ticket intact on premature completion so callers can retry.
+        let ticket = self.tickets.get(&ticket_id).ok_or(GgvlError::UnknownTicket(ticket_id))?;
+        if !ticket.submitted_deps.is_some_and(|deps| deps.is_satisfied_by(self.completed_deps)) {
+            return Err(GgvlError::InFlight(ticket.resource_id));
+        }
+        if !self.resources.contains_key(&ticket.resource_id) {
+            return Err(GgvlError::UnknownResource(ticket.resource_id));
+        }
         let ticket = self
             .tickets
             .remove(&ticket_id)
@@ -360,6 +392,17 @@ impl ResourceCoherencyManager {
 
     /// Cancels a planned or failed transfer without corrupting authoritative state.
     pub fn cancel_transfer(&mut self, ticket_id: u64) -> Result<(), GgvlError> {
+        let ticket = self.tickets.get(&ticket_id).ok_or(GgvlError::UnknownTicket(ticket_id))?;
+        if let Some(deps) = ticket.submitted_deps {
+            if !deps.is_satisfied_by(self.completed_deps) {
+                return Err(GgvlError::InFlight(ticket.resource_id));
+            }
+        } else {
+            // Planning never changed ownership, so an unsubmitted cancellation
+            // must not overwrite page state.
+            self.tickets.remove(&ticket_id);
+            return Ok(());
+        }
         let ticket = self
             .tickets
             .remove(&ticket_id)
