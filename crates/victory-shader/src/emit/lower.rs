@@ -3085,19 +3085,33 @@ impl<'a> Lower<'a> {
         let only = |allowed: &[u8]| {
             (0..count as u8).all(|k| allowed.contains(&k) || !dword(k).is_some_and(read))
         };
-        match count {
-            8 => {
-                const HEIGHT: u32 = 16 << 16 | 14;
-                let v = dword(2)?;
-                let height = self.x.p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+        let is_image_size = || -> bool {
+            const HEIGHT: u32 = 16 << 16 | 14;
+            const WIDTH_LO: u32 = 2 << 16 | 30;
+            let height = dword(2).is_some_and(|v| {
+                self.x.p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
                     i.name() == "s_bfe_u32"
                         && i.reads.iter().any(|r| r.1 == v)
                         && matches!(&i.fields, Fields::Sop { src, .. }
                             if matches!(src.get(1), Some(Operand::Literal(HEIGHT))))
-                });
-                (height && only(&[1, 2, 3])).then_some(true)
-            }
+                })
+            });
+            let width = dword(1).is_some_and(|v| {
+                self.x.p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+                    i.name() == "s_bfe_u32"
+                        && i.reads.iter().any(|r| r.1 == v)
+                        && matches!(&i.fields, Fields::Sop { src, .. }
+                            if matches!(src.get(1), Some(Operand::Literal(WIDTH_LO))))
+                })
+            });
+            (height || width) && only(&[1, 2, 3])
+        };
+        match count {
+            8 => is_image_size().then_some(true),
             4 => {
+                if is_image_size() {
+                    return Some(true);
+                }
                 let used = self.used_kind(&Source::Loaded { load: site, first: 0 })?;
                 let a = self.scalar.get(&site)?;
                 let buffer = used.dwords == 4
