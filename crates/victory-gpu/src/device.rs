@@ -421,6 +421,20 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     E_NOTIMPL
 }
 
+extern "system" fn dispatch_218(
+    this: This,
+    desc: *const pipeline::PreCompiledComputeDesc,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED.get_or_init(|| std::env::var_os("VICTORY_ENABLE_218").is_some()) {
+        pipeline::create_precompiled_compute(this, desc, iid, out)
+    } else {
+        unknown_pipeline::<0x218>(this, desc.cast(), iid, out)
+    }
+}
+
 /// The host device's state: the console's device is removed when the host's is
 /// (VIctory 13185f5: the default answer, E_NOTIMPL, reads as a lost device).
 extern "system" fn removed_reason(_: This) -> HRESULT {
@@ -475,10 +489,9 @@ static FUNCTIONS: Table<160> = {
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
     // Disabled by default: bisecting 0cb96b3..e7f81be isolated f99ddfb (0x218 precompiled
-    // compute PSO dispatch) as the exact cause of the grey/dark scene regression. Keep
-    // `pipeline::create_precompiled_compute` in-tree for debugging its root bindings/outputs,
-    // while restoring the pre-regression stub behavior on slot 0x218.
-    f[67] = unknown_pipeline::<0x218> as *const (); // 0x218
+    // compute PSO dispatch) as the exact cause of the grey/dark scene regression.
+    // Set VICTORY_ENABLE_218=1 to enable 0x218 for shader-by-shader debugging.
+    f[67] = dispatch_218 as *const (); // 0x218
     f[69] = object::ignore as *const (); // 0x228 debug error filter
     f[70] = descriptor::create_placed_srv as *const (); // 0x230
     f[71] = descriptor::create_placed_uav as *const (); // 0x238

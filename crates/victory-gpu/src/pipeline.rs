@@ -496,8 +496,31 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     if let Some(c) = precompiled_counters(p.precompiled_slot) {
         use std::sync::atomic::Ordering::Relaxed;
         if ready.is_some() {
+            if p.precompiled_slot == 0x218 {
+                static SKIP_218: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+                let skips = SKIP_218.get_or_init(|| {
+                    std::env::var("VICTORY_218_SKIP")
+                        .ok()
+                        .map(|v| v.split(',').map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()).collect())
+                        .unwrap_or_default()
+                });
+                if !skips.is_empty() && p.shaders.iter().any(|s| skips.iter().any(|k| s.hash.starts_with(k))) {
+                    c[6].fetch_add(1, Relaxed);
+                    return None;
+                }
+            }
             if !p.executed.swap(true, Relaxed) {
                 let n = c[5].fetch_add(1, Relaxed) + 1;
+                if p.precompiled_slot == 0x218 {
+                    if let Some(s) = p.shaders.first() {
+                        tracing::warn!(slot = "0x218", n, hash = %s.hash, size = s.container.len(), "0x218 compute shader executed");
+                        if let Some(dir) = std::env::var_os("VICTORY_DUMP_218") {
+                            let dir = std::path::PathBuf::from(dir);
+                            let _ = std::fs::create_dir_all(&dir);
+                            let _ = std::fs::write(dir.join(format!("{}.dxbc", s.hash)), &s.container);
+                        }
+                    }
+                }
                 if n <= 4 || n.is_power_of_two() {
                     log_precompiled_summary(p.precompiled_slot, "executed");
                 }
