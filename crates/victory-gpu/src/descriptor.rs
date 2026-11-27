@@ -324,7 +324,18 @@ pub(crate) fn sync_heaps() {
         let mirrored_count = heap.desc.count.min(host.count());
         // The records of some frames ago that no draw read through a table
         // since: a shader may pick them by index.
-        let before = host.copied_before(frame);
+        let mut before = host.copied_before(frame);
+        let retry_tables = host.retry_copied_tables();
+        if retry_tables {
+            before.retain(|&index| {
+                if !host.copied_tabled(index, frame) {
+                    return true;
+                }
+                wait.push(index);
+                tabled += 1;
+                false
+            });
+        }
         let of_tables = std::sync::atomic::AtomicU64::new(0);
         let (pages_a_job, records_a_job) = sync_jobs();
         let phase = crate::timeline::span("the heaps' records: those that waited");
@@ -439,6 +450,9 @@ pub(crate) fn sync_heaps() {
                         // reads of it (`draw.rs` `tables`).
                         if host.copied_tabled(index, frame) {
                             out.tabled += 1;
+                            if retry_tables {
+                                out.wait.push(index);
+                            }
                             continue;
                         }
                         // Buffer views and placed textures get no host

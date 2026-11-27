@@ -3382,7 +3382,25 @@ impl HostHeap {
         }
         let stamp = self.tabled_stamp(index) & !TABLED_READ;
         let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
-        stamp != 0 && now.wrapping_sub(stamp) & !TABLED_READ <= COPIED_FRAMES
+        static FRAMES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let frames = if self.retry_copied_tables() {
+            *FRAMES.get_or_init(|| {
+                std::env::var("VICTORY_TABLED_ALL_FRAMES")
+                    .ok()
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .unwrap_or(60)
+                    .clamp(1, 240)
+            })
+        } else {
+            COPIED_FRAMES
+        };
+        stamp != 0 && now.wrapping_sub(stamp) & !TABLED_READ <= frames
+    }
+
+    /// Keep a retry for table records until their table use expires.
+    pub(crate) fn retry_copied_tables(&self) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_ALL").is_some_and(|value| value == "1"))
     }
 
     /// New records the title copied into slots `slots` in `frame` wait for
