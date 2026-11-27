@@ -3837,8 +3837,13 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
+        // Renderer port 1: indirect arguments or count in title memory read in
+        // place must be clamped alone right before execution (after culling
+        // shader writes finish), never batched or windowed ahead.
+        let in_place_ordered = (args.in_place() || counter.as_ref().is_some_and(|(s, _)| s.in_place()))
+            && std::env::var_os("VICTORY_PORT_CONSTANTS_ORDER").is_none_or(|v| v != "0");
         // One record without a count: clamped in a batch (`batches`).
-        let batch = if batches() > 0 && max == 1 && count.is_none() {
+        let batch = if !in_place_ordered && batches() > 0 && max == 1 && count.is_none() {
             args.refresh(list, arguments, len);
             self.batched(list, &args, arguments, kind)
         } else {
@@ -3853,7 +3858,8 @@ impl State {
         // or may write the arguments.
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
-        let windowed = windows()
+        let windowed = !in_place_ordered
+            && windows()
             && kind != DISPATCH
             && max == 1
             && count.is_none()
