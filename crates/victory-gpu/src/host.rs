@@ -4036,6 +4036,8 @@ fn late_line(frames: f64) {
                 t[0],
                 t[1],
                 t[2],
+            );
+        }
 
         if inflight_fetch() {
             let i: Vec<f64> = INFLIGHT_STATS.iter().map(|i| i.swap(0, Ordering::Relaxed) as f64 / frames).collect();
@@ -5212,25 +5214,9 @@ impl Host {
                     meanwhile();
                     return;
                 }
-                let mut total = 0u64;
-                let pieces: Vec<_> = left.into_iter().map(|(s, lo, hi)| { let at = total; total += (hi - lo) as u64; (s, lo, hi, at) }).collect();
                 INFLIGHT_STATS[3].fetch_add(1, Ordering::Relaxed);
-                let _ = (pieces, total);
             }
         }
-        }
-        let pieces = match staged {
-            Some(left) => left,
-            None => self.relay_flagged(plans),
-        };
-        self.relay_fetch_pieces(plans, pieces, fetch);
-    }
-
-    /// For [`Host::relay_card_back`]: the pieces (copy, offsets) these plans'
-    /// compares flagged, each once, a piece flagged under one range of a
-    /// plan under all ([`flagged_pieces`]); every piece of a range not
-    /// compared.
-    fn relay_flagged(&self, plans: &[&CardPlan]) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
         let differs = {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
             work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
