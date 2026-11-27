@@ -78,6 +78,18 @@ cargo build --locked --profile diag -p victory --features diagnostics
 .\target\diag\versus.exe --help
 ```
 
+### DLSS Super Resolution on Windows
+
+Use the x64 runtime from the [NVIDIA Streamline 2.14.16 release](https://github.com/NVIDIA-RTX/Streamline/releases/tag/v2.14.16).
+Set `VICTORY_STREAMLINE_DIR` to its `bin/x64` directory. Run
+`versus upscaler-check --device` to check Streamline and DLSS on the host GPU.
+
+For the supported Series X image, set `VICTORY_DLSS=1`, `VICTORY_OUTPUT=2560x1440`,
+and `VICTORY_DLSS_MODE=quality`. DLSS chooses the internal resolution in this
+profile. Keep `VICTORY_FRAMEGEN=0` when measuring rendered performance. The log
+reports DLSS evaluations and fallbacks to the title's FidelityFX upscaler.
+
+
 The Cargo package is still named `victory`, but the executable is `versus.exe`. Some inherited scripts still reference `victory.exe`; check their executable paths before use.
 
 ### Experimental configuration

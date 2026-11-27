@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 versus-backend.workspace = true
 victory-core.workspace = true
+victory-formats = { path = "../../crates/victory-formats" }
 victory-pe.workspace = true
 victory-loader.workspace = true
 victory-hle.workspace = true

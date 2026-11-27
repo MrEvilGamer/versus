@@ -2552,6 +2552,14 @@ pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u
 /// The host GPU's copy of a title resource, if it has one: made now if
 /// this is the texture's first use ([`Hosted`]). Asking is a use; what must
 /// not count as one asks `host_made`.
+/// Recognizes a title resource before interpreting an external ABI pointer.
+#[cfg(windows)]
+pub(crate) fn is_resource(this: This) -> bool {
+    let mut table = [0; size_of::<usize>()];
+    crate::host::read_into(this.cast(), &mut table)
+        && usize::from_ne_bytes(table) == RESOURCE_FUNCTIONS.0.as_ptr() as usize
+}
+
 #[cfg(windows)]
 pub(crate) fn host_resource<'a>(
     this: This,

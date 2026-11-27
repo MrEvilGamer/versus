@@ -646,6 +646,7 @@ dependencies = [
  "memchr",
  "versus-backend",
  "victory-core",
+ "victory-formats",
  "victory-game",
  "victory-hle",
  "victory-loader",

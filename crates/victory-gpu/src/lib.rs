@@ -31,6 +31,8 @@ pub mod device;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
+#[cfg(windows)]
+mod external;
 pub mod fence;
 pub mod frame;
 #[cfg(windows)]
@@ -79,6 +81,8 @@ mod shadow;
 #[cfg(windows)]
 mod tiles;
 pub mod signature;
+#[cfg(windows)]
+pub mod streamline;
 mod switch;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod ab;

@@ -54,14 +54,43 @@ pub fn run(
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
-    let prepared = victory_loader::prepare(&original)?;
+    let mut prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
     match victory_game::identify(&hash) {
         Some(build) => println!("build          {} ({hash})", build.label),
         None => println!("build          unknown ({hash})"),
     }
 
-    let images = cfg.cache_subdir("images")?;
+    let mut upscaler_cache = None;
+    if execute {
+        let asked = victory_hle::streamline::Asked::from_env().map_err(anyhow::Error::msg)?;
+        if asked.any() {
+            let available = victory_hle::streamline::init(&asked);
+            if available.dlss || available.framegen {
+                let mode = asked.mode;
+                let output = victory_loader::resolution::asked_output();
+                let native_1440p = matches!(console, Console::SeriesX) && output == Some((2560, 1440));
+                let mut candidate = victory_loader::prepare(&original)?;
+                let patch = (|| -> Result<()> {
+                    anyhow::ensure!(output.is_none() || native_1440p, "Streamline supports stock output and Series X 2560x1440");
+                    if native_1440p {
+                        crate::native_1440p::prepare(&mut candidate, false)?;
+                    }
+                    crate::native_1440p::prepare_upscaler(&mut candidate, mode)
+                })();
+                match patch {
+                    Ok(()) => {
+                        prepared = candidate;
+                        let profile = if native_1440p { "1440p" } else { "stock" };
+                        upscaler_cache = Some(format!("images/streamline-{profile}-{}", mode.name()));
+                        println!("upscaling      {} via the title's FidelityFX path", mode.name());
+                    }
+                    Err(error) => eprintln!("leaving the title's upscaler in place: {error:#}"),
+                }
+            }
+        }
+    }
+    let images = cfg.cache_subdir(upscaler_cache.as_deref().unwrap_or("images"))?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = victory_loader::load(&prepared, &images)?;
     // The program is mapped from the copy `load` wrote: the file's bytes
@@ -162,12 +191,17 @@ pub fn run(
         show(name, dll.bind_imports(&with_dlls, policy)?);
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
-    show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    // The title's FidelityFX calls go through ours when DLSS or frame
+    // generation is on (bound as before otherwise).
+    let interposed = victory_hle::modules::fidelityfx::Interpose { inner: &with_dlls };
+    show(&exe_name, image.bind_imports(&interposed, policy)?);
     if execute {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped, and nothing of it has run yet.
         unsafe { victory_loader::write_sites::apply_asked(&image_name, image.base(), size) };
-        unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+        if upscaler_cache.is_none() {
+            unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+        }
     }
     if !execute {
         println!("not executing (pass --execute to start the title)");
