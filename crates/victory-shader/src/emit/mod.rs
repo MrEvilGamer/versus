@@ -3044,6 +3044,21 @@ mod barycentric_tests {
         layout: Vec<RootParam>,
         used: Vec<UsedResource>,
     ) -> Result<HostShader, ShaderError> {
+        pixel_with_layout(words, input_addr, fp16, layout, used, &[element("TEXCOORD", 0, 0)])
+    }
+
+    fn pixel_with_inputs(words: &[u32], input_addr: u32, inputs: &[SigElement]) -> Result<HostShader, ShaderError> {
+        pixel_with_layout(words, input_addr, false, Vec::new(), Vec::new(), inputs)
+    }
+
+    fn pixel_with_layout(
+        words: &[u32],
+        input_addr: u32,
+        fp16: bool,
+        layout: Vec<RootParam>,
+        used: Vec<UsedResource>,
+        inputs: &[SigElement],
+    ) -> Result<HostShader, ShaderError> {
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,

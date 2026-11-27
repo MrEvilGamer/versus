@@ -197,7 +197,7 @@ fn half_sum_program() -> (NativeProgram, u16, u16) {
         tree = tree.chunks(2).map(|c| add(c[0], c[1])).collect();
     }
     let in_a_row = terms.iter().copied().reduce(add).unwrap();
-    (native(&words), tree[0], in_a_row)
+    (native, tree[0], in_a_row)
 }
 
 #[test]
