@@ -1906,6 +1906,18 @@ pub(crate) fn targets_room_kept() -> u64 {
     most.saturating_sub(targets)
 }
 
+#[cfg(windows)]
+pub(crate) fn target_bytes() -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed))
+}
+
+#[cfg(windows)]
+pub(crate) fn filled_bytes() -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    KINDS[1].load(Relaxed) + crate::tiles::given_total()
+}
+
 /// [`room`] as it was at most a tenth of a second ago, for a question
 /// asked of many textures a frame ([`room`] asks the system each time).
 #[cfg(windows)]

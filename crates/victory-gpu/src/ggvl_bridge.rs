@@ -263,13 +263,17 @@ pub(crate) fn on_vram_budget(budget_bytes: u64, usage_bytes: u64) {
             let local_tracked_mb = tex_heap_mb + local_shadow_mb;
             let reclaim_req_mb = st.controller.reclamation_required_bytes() >> 20;
             let usage_mb = usage_bytes >> 20;
-            let unaccounted_local_mb = usage_mb.saturating_sub(local_tracked_mb);
+            let rt_depth_mb = crate::resource::target_bytes() >> 20;
+            let filled_tex_mb = crate::resource::filled_bytes() >> 20;
+            let unaccounted_local_mb = usage_mb.saturating_sub(local_tracked_mb + rt_depth_mb);
             tracing::info!(
                 pressure,
                 budget_mb = budget_bytes >> 20,
                 usage_mb,
                 local_tracked_mb,
                 tex_heap_mb,
+                filled_tex_mb,
+                rt_depth_mb,
                 local_shadow_mb,
                 sys_shadow_mb,
                 unaccounted_local_mb,
