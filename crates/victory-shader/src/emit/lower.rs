@@ -10901,8 +10901,8 @@ impl<'a> Lower<'a> {
             // shortcut: stores are taken to write all four channels of a
             // float format (the console converts by the view's format).
             // One channel goes into a view the program also counts in.
-            let counter = *dmask == 1 && self.is_counter(src);
-            if *dmask == 0 || *dmask > 0xF || (self.is_counter(src) && !counter) {
+            let counter = self.is_counter(src);
+            if *dmask == 0 || *dmask > 0xF {
                 return Err("an image store of some channels");
             }
             let iu = self.s.m.undef(self.s.t.i32);
@@ -10914,13 +10914,18 @@ impl<'a> Lower<'a> {
                 return Err("image store data");
             };
             if counter {
-                let v = inst.read(Reg::V(reg)).ok_or("image store data")?;
-                let x = self.i32_of(v)?;
-                // A 16-bit integer, extended by the view's sign: the same
-                // number either way only if it is known to be small.
-                if *d16 && !self.s.m.int_k(x).is_some_and(|(_, k)| k < 0x8000) {
-                    return Err("a 16-bit image store of one channel");
-                }
+                let x = if (*dmask & 1) != 0 {
+                    let v = inst.read(Reg::V(reg)).ok_or("image store data")?;
+                    let x = self.i32_of(v)?;
+                    // A 16-bit integer, extended by the view's sign: the same
+                    // number either way only if it is known to be small.
+                    if *d16 && !self.s.m.int_k(x).is_some_and(|(_, k)| k < 0x8000) {
+                        return Err("a 16-bit image store of one channel");
+                    }
+                    x
+                } else {
+                    self.s.m.i32(0)
+                };
                 let h = self.handle(site, src, false, (kind | 0x1000 | rov, 0x105))?;
                 let at = self.begin_guarded(guard);
                 // All four channels are written (the validator wants them
