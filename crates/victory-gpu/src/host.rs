@@ -9266,7 +9266,15 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let since = crate::watch::changes();
     // (A title destination that is away only while the runtime changes a
     // mapping beside it is written when that is done.)
-    let whole = read(src, dst, len) || title_dst && crate::watch::again_after_change(since, || read(src, dst, len));
+    static WIDE_READ: OnceLock<bool> = OnceLock::new();
+    let wide = !title_dst
+        && len >= 4 << 20
+        && *WIDE_READ.get_or_init(|| crate::switch::on("VICTORY_WIDE_MAPPED_READ"))
+        && !crate::shadow::in_wide_job()
+        && (src as usize).abs_diff(dst as usize) >= len;
+    let whole = wide && read_mapped_wide(src, dst, len)
+        || read(src, dst, len)
+        || title_dst && crate::watch::again_after_change(since, || read(src, dst, len));
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -9404,6 +9412,23 @@ pub(crate) fn read_there(src: *const u8, dst: &mut [u8]) -> usize {
         });
     }
     got
+}
+
+/// All workers read disjoint host destination ranges. On failure the caller
+/// retries the original kernel read and preserves the mapped-page fallback.
+fn read_mapped_wide(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    const CHUNK: usize = 2 << 20;
+    let (src, dst) = (src as usize, dst as usize);
+    let success = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let count = len.div_ceil(CHUNK);
+    let status = success.clone();
+    crate::shadow::wide_each(count, move |piece| {
+        let at = piece * CHUNK;
+        if !read((src + at) as *const u8, (dst + at) as *mut u8, CHUNK.min(len - at)) {
+            status.store(false, Ordering::Relaxed);
+        }
+    });
+    success.load(Ordering::Relaxed)
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not

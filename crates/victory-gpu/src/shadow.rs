@@ -1684,6 +1684,14 @@ fn workers() -> &'static Workers {
     workers
 }
 
+thread_local! {
+    static IN_WIDE_JOB: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn in_wide_job() -> bool {
+    IN_WIDE_JOB.with(std::cell::Cell::get)
+}
+
 /// Runs `jobs` on the kept threads and on this one, and returns when all
 /// of them are done. The jobs copy and compare memory; they do not panic.
 fn wide(jobs: Vec<Job>) {
@@ -1702,7 +1710,11 @@ fn wide(jobs: Vec<Job>) {
             let left = left.clone();
             workers.there.fetch_add(1, Ordering::AcqRel);
             queue.push_back(Box::new(move || {
-                job();
+                IN_WIDE_JOB.with(|running| {
+                    let previous = running.replace(true);
+                    job();
+                    running.set(previous);
+                });
                 let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
                 *n -= 1;
                 if *n == 0 {
