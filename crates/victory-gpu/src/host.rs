@@ -465,9 +465,10 @@ fn bury(finished: u64) {
 }
 
 /// Global pool of 64 KiB indirect-batch scratch buffers returned on `HostList::reset()`.
-/// Prevents unbounded per-list VRAM growth (~3.8 GB leak across command lists).
+/// Prevents unbounded per-list VRAM growth (~3.8 GB leak across command lists) and
+/// eliminates per-frame CreateCommittedResource churn.
 static BATCH_ARGS_POOL: Mutex<Vec<ID3D12Resource>> = Mutex::new(Vec::new());
-const MAX_POOLED_BATCH_ARGS: usize = 64;
+const MAX_POOLED_BATCH_ARGS: usize = 512;
 
 fn take_batch_arg() -> Option<ID3D12Resource> {
     BATCH_ARGS_POOL.lock().unwrap_or_else(|e| e.into_inner()).pop()
@@ -10450,20 +10451,9 @@ impl Host {
 
     /// A device-local buffer shaders may write (unordered access) and indirect
     /// execution may read, starting in the common state.
-    #[track_caller]
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
-        let count = MADE[4].fetch_add(1, Ordering::Relaxed) + 1;
-        let total = MADE[5].fetch_add(size, Ordering::Relaxed) + size;
-        if (total >> 20) / 100 > ((total - size) >> 20) / 100 {
-            let loc = std::panic::Location::caller();
-            tracing::info!(
-                caller = %format!("{}:{}", loc.file(), loc.line()),
-                size_kb = size >> 10,
-                count,
-                total_mb = total >> 20,
-                "uav_buffer milestone"
-            );
-        }
+        MADE[4].fetch_add(1, Ordering::Relaxed);
+        MADE[5].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_DEFAULT,
             ..Default::default()
