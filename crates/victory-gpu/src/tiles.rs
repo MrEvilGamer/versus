@@ -146,6 +146,46 @@ impl Heap {
 /// The pool's heaps by place; a place is empty after its heap went back to
 /// the card (a texture names its heaps by place).
 static POOL: Mutex<Vec<Option<Heap>>> = Mutex::new(Vec::new());
+/// Returned tile runs resting until in-flight GPU lists finish (matches `pool::REST`).
+static RESTING: Mutex<std::collections::VecDeque<(u64, usize, Vec<(u32, u32)>)>> =
+    Mutex::new(std::collections::VecDeque::new());
+const TILE_REST_MS: u64 = 2500;
+
+fn drain_rested(pool: &mut [Option<Heap>]) {
+    let now = crate::host::now_ms();
+    let mut rested = Vec::new();
+    {
+        let mut resting = RESTING.lock().unwrap_or_else(|e| e.into_inner());
+        while resting.front().is_some_and(|(ready, _, _)| *ready <= now) {
+            if let Some((_, index, runs)) = resting.pop_front() {
+                rested.push((index, runs));
+            }
+        }
+    }
+    for (index, runs) in rested {
+        let Some(Some(h)) = pool.get_mut(index) else {
+            continue;
+        };
+        h.free.extend_from_slice(&runs);
+        h.free.sort_unstable();
+        let mut joined: Vec<(u32, u32)> = Vec::with_capacity(h.free.len());
+        for &(from, tiles) in &h.free {
+            match joined.last_mut() {
+                Some(last) if last.0 + last.1 == from => last.1 += tiles,
+                _ => joined.push((from, tiles)),
+            }
+        }
+        h.free = joined;
+        let all_free = h.free_tiles() == HEAP_TILES;
+        if all_free && pool.iter().flatten().count() > 1 {
+            if let Some(removed) = pool[index].take() {
+                crate::host::retire(removed.heap);
+            }
+            STATS[3].fetch_sub(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
+            STATS[8].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
 
 /// `count` tiles of one heap, in as many runs as it takes, the lowest free
 /// tiles first (single free tiles are used up before a long run is cut):
@@ -156,6 +196,7 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
         return None;
     }
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    drain_rested(&mut pool);
     let found = pool.iter().position(|h| h.as_ref().is_some_and(|h| h.free_tiles() >= count));
     let index = match found {
         Some(index) => index,
@@ -209,32 +250,17 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
     Some((h.heap.clone(), index, runs))
 }
 
-/// Gives the runs `runs` of the pool's heap at `index` back; runs that
-/// touch become one. A heap with every tile free goes back to the card,
-/// unless it is the pool's only one. (Called when the texture that held
-/// the tiles is dropped: nothing on the card reads through its mappings
-/// any more, as for any host texture that is dropped.)
+/// Queues the runs `runs` of the pool's heap at `index` to rest for
+/// [`TILE_REST_MS`] before reuse or fence-safe heap retirement.
 fn give_back(index: usize, runs: &[(u32, u32)]) {
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(Some(h)) = pool.get_mut(index) else {
+    if runs.is_empty() {
         return;
-    };
-    h.free.extend_from_slice(runs);
-    h.free.sort_unstable();
-    let mut joined: Vec<(u32, u32)> = Vec::with_capacity(h.free.len());
-    for &(from, tiles) in &h.free {
-        match joined.last_mut() {
-            Some(last) if last.0 + last.1 == from => last.1 += tiles,
-            _ => joined.push((from, tiles)),
-        }
     }
-    h.free = joined;
-    let all_free = h.free_tiles() == HEAP_TILES;
-    if all_free && pool.iter().flatten().count() > 1 {
-        pool[index] = None;
-        STATS[3].fetch_sub(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
-        STATS[8].fetch_add(1, Ordering::Relaxed);
-    }
+    let ready = crate::host::now_ms().saturating_add(TILE_REST_MS);
+    RESTING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push_back((ready, index, runs.to_vec()));
 }
 
 /// What is given so far to one texture.

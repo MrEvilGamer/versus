@@ -25,9 +25,13 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{GUID, HRESULT, IUnknown, Interface};
 
-/// Bytes of a block; pieces of more than half of one are not pooled (with
-/// blocks made ahead, [`ahead`]: of more than one).
-const BLOCK: u64 = 64 << 20;
+/// Bytes of a VRAM texture pool block (64 MiB; smaller blocks cause 0x80070057 on launch).
+const TEXTURE_BLOCK: u64 = 64 << 20;
+/// Bytes of a staging upload block (64 MiB in system RAM; staging copies assume 64 MiB).
+const STAGING_BLOCK: u64 = 64 << 20;
+/// Default block size alias for tests.
+#[cfg_attr(not(test), allow(dead_code))]
+const BLOCK: u64 = TEXTURE_BLOCK;
 /// Blocks with nothing in them that are kept.
 const SPARE: usize = 2;
 /// The same while the card has room ([`room`]): 4 GiB of them.
@@ -237,11 +241,18 @@ struct Pool<B> {
     /// The empty blocks it was last told to keep, and the most it keeps.
     spare: usize,
     most: usize,
+    /// Size of each block in bytes.
+    block_size: u64,
 }
 
 impl<B: Clone> Pool<B> {
+    #[cfg_attr(not(test), allow(dead_code))]
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most }
+        Pool::with_block_size(most, TEXTURE_BLOCK)
+    }
+
+    const fn with_block_size(most: usize, block_size: u64) -> Pool<B> {
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, block_size }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -262,13 +273,14 @@ impl<B: Clone> Pool<B> {
     ) -> Option<(Piece, B, bool)> {
         // With blocks made ahead, what would be an allocation of its own (and
         // new when the card first reads it) lies in one of those too.
-        if len == 0 || len > if ripe.ahead > 0 { BLOCK } else { BLOCK / 2 } {
+        if len == 0 || len > if ripe.ahead > 0 { self.block_size } else { self.block_size / 2 } {
             return None;
         }
         self.rested(now);
         // Phase 1: Alignment-aware best-fit across compatible, non-draining ripe blocks.
         // Prefer partially occupied blocks over empty blocks, and among those prefer the
         // most-occupied block with the tightest remaining range.
+        let block_size = self.block_size;
         let best_ripe = self
             .blocks
             .iter()
@@ -279,7 +291,7 @@ impl<B: Clone> Pool<B> {
                     return None;
                 }
                 let (rem, _at) = block.free.best_fit_candidate(len, align)?;
-                let is_empty = block.free.whole(BLOCK);
+                let is_empty = block.free.whole(block_size);
                 let total_free = block.free.total_free();
                 Some(((is_empty, total_free, rem, i), i))
             })
@@ -315,7 +327,7 @@ impl<B: Clone> Pool<B> {
                 }
             }
             if !crate::ggvl_bridge::vram_under_pressure() {
-                let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
+                let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(block_size)).count();
                 if empty < ripe.ahead
                     && let Some(memory) = make()
                 {
@@ -339,7 +351,7 @@ impl<B: Clone> Pool<B> {
         };
         self.blocks[i] = Some(Block {
             memory,
-            free: Ranges::new(BLOCK),
+            free: Ranges::new(self.block_size),
             used_to: 0,
             made,
             since: crate::host::now_ms(),
@@ -355,13 +367,14 @@ impl<B: Clone> Pool<B> {
     /// Reclaims fence-safe empty `Block` heaps beyond `keep` spares under VRAM pressure.
     fn reclaim_empty(&mut self, keep: usize, finished_sub: u64, now: u64) -> Vec<B> {
         self.rested(now);
+        let block_size = self.block_size;
         let mut empty_indices: Vec<usize> = self
             .blocks
             .iter()
             .enumerate()
             .filter_map(|(i, b)| {
                 let b = b.as_ref()?;
-                (b.free.whole(BLOCK) && b.made <= finished_sub).then_some(i)
+                (b.free.whole(block_size) && b.made <= finished_sub).then_some(i)
             })
             .collect();
         if empty_indices.len() <= keep {
@@ -395,15 +408,16 @@ impl<B: Clone> Pool<B> {
         let mut empty_bytes = 0u64;
         let mut fragmented_free_bytes = 0u64;
         let mut occupied_bytes = 0u64;
+        let block_size = self.block_size;
         for block in self.blocks.iter().flatten() {
             total_blocks += 1;
-            if block.free.whole(BLOCK) {
+            if block.free.whole(block_size) {
                 empty_blocks += 1;
-                empty_bytes += BLOCK;
+                empty_bytes += block_size;
             } else {
                 let free_in_block: u64 = block.free.0.values().copied().sum();
                 fragmented_free_bytes += free_in_block;
-                occupied_bytes += BLOCK.saturating_sub(free_in_block);
+                occupied_bytes += block_size.saturating_sub(free_in_block);
             }
         }
         let deferred_release_bytes: u64 = self.resting.iter().map(|(_, p)| p.len).sum();
@@ -421,17 +435,18 @@ impl<B: Clone> Pool<B> {
     /// Marks up to `max_heaps` sparsely occupied (<= `max_occupancy_pct`%) non-empty
     /// blocks as draining so new allocations stop landing in them.
     fn select_evacuation_heaps(&mut self, max_occupancy_pct: u64, max_heaps: usize) -> usize {
-        let max_occupied = BLOCK.saturating_mul(max_occupancy_pct) / 100;
+        let block_size = self.block_size;
+        let max_occupied = block_size.saturating_mul(max_occupancy_pct) / 100;
         let mut candidates: Vec<(u64, usize)> = self
             .blocks
             .iter()
             .enumerate()
             .filter_map(|(i, b)| {
                 let b = b.as_ref()?;
-                if b.draining || b.free.whole(BLOCK) {
+                if b.draining || b.free.whole(block_size) {
                     return None;
                 }
-                let occupied = BLOCK.saturating_sub(b.free.total_free());
+                let occupied = block_size.saturating_sub(b.free.total_free());
                 (occupied > 0 && occupied <= max_occupied).then_some((occupied, i))
             })
             .collect();
@@ -474,8 +489,8 @@ struct Upload(ID3D12Resource, *mut u8);
 // SAFETY: the mapping is written by the owners of its pieces, each its own.
 unsafe impl Send for Upload {}
 
-static TEXTURES: Mutex<Pool<(ID3D12Heap, u64)>> = Mutex::new(Pool::new(SPARE_KEPT));
-static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT));
+static TEXTURES: Mutex<Pool<(ID3D12Heap, u64)>> = Mutex::new(Pool::with_block_size(SPARE_KEPT, TEXTURE_BLOCK));
+static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::with_block_size(STAGING_KEPT, STAGING_BLOCK));
 
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -487,13 +502,16 @@ static HELD: AtomicU64 = AtomicU64::new(0);
 /// Bytes of the texture blocks no texture holds: the card's memory in use
 /// by us that new textures take first.
 pub(crate) fn texture_room() -> u64 {
-    (lock(&TEXTURES).blocks() as u64 * BLOCK).saturating_sub(HELD.load(Ordering::Relaxed))
+    (lock(&TEXTURES).blocks() as u64 * TEXTURE_BLOCK).saturating_sub(HELD.load(Ordering::Relaxed))
 }
 
 /// For the memory line: blocks of textures and of staging buffers, in MiB.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 2] {
-    [lock(&TEXTURES).blocks() as u64 * (BLOCK >> 20), lock(&STAGING).blocks() as u64 * (BLOCK >> 20)]
+    [
+        lock(&TEXTURES).blocks() as u64 * (TEXTURE_BLOCK >> 20),
+        lock(&STAGING).blocks() as u64 * (STAGING_BLOCK >> 20),
+    ]
 }
 
 /// Part of a block of mapped upload memory, back in the pool when dropped.
@@ -514,7 +532,7 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     // Copies from a buffer begin at multiples of 512.
     let bytes = bytes.next_multiple_of(512);
     let (piece, memory, again) = lock(&STAGING).take(bytes, 512, now(), || {
-        let (buffer, data) = host.upload_buffer(BLOCK)?;
+        let (buffer, data) = host.upload_buffer(STAGING_BLOCK)?;
         crate::host::name(&buffer, || "staging of textures (a block)".into());
         Some(Upload(buffer, data))
     })?;
@@ -783,7 +801,7 @@ pub(crate) unsafe fn texture(
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
     let (piece, (heap, _backing_id), again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
         let desc = D3D12_HEAP_DESC {
-            SizeInBytes: BLOCK,
+            SizeInBytes: TEXTURE_BLOCK,
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
             Alignment: 0,
             Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | crate::host::not_resident(),
@@ -800,7 +818,7 @@ pub(crate) unsafe fn texture(
             return None;
         }
         heap.map(|h| {
-            let id = crate::ggvl_bridge::register_texture_heap(BLOCK);
+            let id = crate::ggvl_bridge::register_texture_heap(TEXTURE_BLOCK);
             (h, id)
         })
     })?;

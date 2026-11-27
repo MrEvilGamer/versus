@@ -464,6 +464,38 @@ fn bury(finished: u64) {
     }
 }
 
+/// Global pool of 64 KiB indirect-batch scratch buffers returned on `HostList::reset()`.
+/// Prevents unbounded per-list VRAM growth (~3.8 GB leak across command lists).
+static BATCH_ARGS_POOL: Mutex<Vec<ID3D12Resource>> = Mutex::new(Vec::new());
+const MAX_POOLED_BATCH_ARGS: usize = 64;
+
+fn take_batch_arg() -> Option<ID3D12Resource> {
+    BATCH_ARGS_POOL.lock().unwrap_or_else(|e| e.into_inner()).pop()
+}
+
+fn give_batch_args(buffers: Vec<ID3D12Resource>) {
+    if buffers.is_empty() {
+        return;
+    }
+    let mut pool = BATCH_ARGS_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    for buf in buffers {
+        if pool.len() < MAX_POOLED_BATCH_ARGS {
+            pool.push(buf);
+        }
+        // Any excess buffers are dropped here (the list has already finished executing).
+    }
+}
+
+/// Diagnostic: total `uav_buffer` bytes created so far and current `RETIRED` queue length.
+pub(crate) fn vram_diag() -> (u64, usize) {
+    let uav_bytes = MADE[5].load(Ordering::Relaxed);
+    let retired_len: usize = RETIRED
+        .iter()
+        .map(|p| p.lock().map(|g| g.len()).unwrap_or(0))
+        .sum();
+    (uav_bytes, retired_len)
+}
+
 /// Objects [`retire`] dropped at once (no submission was running) and
 /// kept until a running submission finished, since the start.
 static RETIREMENTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
@@ -7120,6 +7152,11 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
+            let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
+            args.1 = 0;
+            give_batch_args(std::mem::take(&mut args.0));
+        }
+        {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
             // Every submission of the list has run: nothing reads its
@@ -7944,9 +7981,12 @@ impl HostList {
         let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
         let (buffer, i) = ((args.1 / BATCHES) as usize, args.1 % BATCHES);
         if buffer == args.0.len() {
-            let size = u64::from(BATCHES * JOBS * SLOT);
-            let made = host()?.uav_buffer(size)?;
-            name(&made, || format!("indirect batches {size:#x}"));
+            let made = take_batch_arg().or_else(|| {
+                let size = u64::from(BATCHES * JOBS * SLOT);
+                let made = host()?.uav_buffer(size)?;
+                name(&made, || format!("indirect batches {size:#x}"));
+                Some(made)
+            })?;
             args.0.push(made);
         }
         args.1 += 1;
@@ -10410,9 +10450,20 @@ impl Host {
 
     /// A device-local buffer shaders may write (unordered access) and indirect
     /// execution may read, starting in the common state.
+    #[track_caller]
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
-        MADE[4].fetch_add(1, Ordering::Relaxed);
-        MADE[5].fetch_add(size, Ordering::Relaxed);
+        let count = MADE[4].fetch_add(1, Ordering::Relaxed) + 1;
+        let total = MADE[5].fetch_add(size, Ordering::Relaxed) + size;
+        if (total >> 20) / 100 > ((total - size) >> 20) / 100 {
+            let loc = std::panic::Location::caller();
+            tracing::info!(
+                caller = %format!("{}:{}", loc.file(), loc.line()),
+                size_kb = size >> 10,
+                count,
+                total_mb = total >> 20,
+                "uav_buffer milestone"
+            );
+        }
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_DEFAULT,
             ..Default::default()
