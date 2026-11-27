@@ -1742,17 +1742,14 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             }
         }
         // The levels views show ([`held_only`]), those of the slots shaders
-        // pick by index among them, plus optional `VICTORY_MAX_TEXTURE_DIM` cap
-        // for all game-filled 2D mipmapped textures (placed or committed).
+        // pick by index among them, plus optional `VICTORY_MAX_TEXTURE_DIM` cap.
         let mut base = 0;
-        if shape_fits && held_only() && alias_of(this).is_none() {
-            if r.host.placed.load(Relaxed) {
-                let wanted = r.host.wanted.load(Relaxed);
-                let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
-                let first = wanted.min(viewed);
-                if first != u32::MAX {
-                    base = base_level(&r.desc, first);
-                }
+        if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
+            let wanted = r.host.wanted.load(Relaxed);
+            let viewed = crate::descriptor::host::first_viewed(r.data() as u64).unwrap_or(u32::MAX);
+            let first = wanted.min(viewed);
+            if first != u32::MAX {
+                base = base_level(&r.desc, first);
             }
             let cap_level = crate::tiles::min_allowed_level(
                 r.desc.width,
