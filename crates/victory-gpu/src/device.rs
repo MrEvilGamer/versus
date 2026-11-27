@@ -474,7 +474,11 @@ static FUNCTIONS: Table<160> = {
     f[57] = unknown_pipeline::<0x1c8> as *const (); // 0x1c8
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
-    f[67] = pipeline::create_precompiled_compute as *const (); // 0x218
+    // Disabled by default: bisecting 0cb96b3..e7f81be isolated f99ddfb (0x218 precompiled
+    // compute PSO dispatch) as the exact cause of the grey/dark scene regression. Keep
+    // `pipeline::create_precompiled_compute` in-tree for debugging its root bindings/outputs,
+    // while restoring the pre-regression stub behavior on slot 0x218.
+    f[67] = unknown_pipeline::<0x218> as *const (); // 0x218
     f[69] = object::ignore as *const (); // 0x228 debug error filter
     f[70] = descriptor::create_placed_srv as *const (); // 0x230
     f[71] = descriptor::create_placed_uav as *const (); // 0x238
