@@ -241,7 +241,7 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     uint at0 = (q.y * PX + q.x) * 3;
     float3 seen_there = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
     float far = float(at.z) / float(d);
-    float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
+    float cap = air * (constant > 0.0 ? constant : lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far));
     float3 c = scattered[at];
     float has = dot(c, LUMA);
     if (has > cap) scattered[at] = c * (cap / has);
@@ -437,7 +437,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role != Role::Radiance && constant == 0.0 && !KEPT.load(Ordering::Relaxed) {
         return false;
     }
-    if role == Role::Air && (constant > 0.0 || air() == 0.0) {
+    if role == Role::Air && air() == 0.0 {
         return false;
     }
     static SAID: Mutex<u32> = Mutex::new(0);

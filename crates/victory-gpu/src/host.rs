@@ -4102,6 +4102,8 @@ fn late_line(frames: f64) {
         );
     }
     card_steps::log(frames);
+    crate::port::log(frames);
+    crate::port_cbv::log(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
@@ -8133,6 +8135,7 @@ impl HostList {
                     }
                     batch.fill();
                     batch.title_written();
+                    crate::port::copied(dst, src, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -8148,6 +8151,7 @@ impl HostList {
                     {
                         copies += 1;
                     }
+                    crate::port::filled(src, len);
                     if wide_fills() {
                         batch.fills.push((dst, src, len));
                         bytes += len as u64;

@@ -2273,7 +2273,11 @@ pub(crate) fn let_go_idle() {
         let r = unsafe { &*(at as *const Resource) };
         // (Without its lock first: most were used lately or have none.)
         let used = r.host.used.load(Relaxed);
-        if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) || crate::texture::host_wrote(at) {
+        if used == 0
+            || !fills(&r.desc)
+            || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES)
+            || crate::texture::host_wrote(at)
+        {
             continue;
         }
         let gone = {
