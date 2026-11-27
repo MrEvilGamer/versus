@@ -2268,9 +2268,10 @@ pub(crate) fn inflight_piece_from(span: &crate::shadow::CardSpan, i: u32) -> usi
     lo & !15
 }
 
-/// The 1 KiB steps of a slot: what stage 1 of [`CARD_FETCH`] dispatches
-/// across.
-pub(crate) const INFLIGHT_STEPS: u32 = INFLIGHT_SLOT.div_ceil(1024) as u32;
+/// Stage 1 of [`CARD_FETCH`] dispatches one 64-thread workgroup per candidate
+/// piece (checking its ticket once and looping 1 KiB per iteration) instead of
+/// 65 workgroups per piece.
+pub(crate) const INFLIGHT_STEPS: u32 = 1;
 
 /// The fetch inside a flight ([`inflight_fetch`]), run in the compare's list
 /// behind the compares of the declared ranges, in two stages with a UAV
@@ -2330,9 +2331,11 @@ void main(uint3 group : SV_GroupID, uint3 id : SV_DispatchThreadID, uint t : SV_
         uint hi = min((piece + 1u) * 65536u - skew, size);
         lo = lo & ~15u;
         hi = (hi + 15u) & ~15u;
-        uint at = lo + group.x * 1024u + t * 16u;
-        if (at < hi) {
-            staging.Store4((base + k) * SLOT + (at - lo), now.Load4(at));
+        uint len = hi - lo;
+        uint dst = (base + k) * SLOT;
+        [loop]
+        for (uint off = t * 16u; off < len; off += 1024u) {
+            staging.Store4(dst + off, now.Load4(lo + off));
         }
     }
 }
