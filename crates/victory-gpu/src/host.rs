@@ -2314,7 +2314,7 @@ void main(uint3 group : SV_GroupID, uint3 id : SV_DispatchThreadID, uint t : SV_
     if (stage == 0u) {
         if (id.x >= pieces) return;
         uint entry = NONE;
-        if (differs.Load(out_at + id.x * 4u) != 0u) {
+        if ((differs.Load(out_at + id.x * 4u) & 1u) != 0u) {
             table.InterlockedAdd(base * 4u, 1u, entry);
         }
         table.Store(entries + out_at + id.x * 4u, entry);
@@ -5595,11 +5595,12 @@ impl Host {
                 // Pieces (copy, number) flagged, with their slot where staged.
                 let mut slots: std::collections::HashMap<(usize, u32), u32> = std::collections::HashMap::new();
                 let mut flags: Vec<(usize, u32, bool)> = Vec::new();
+                plan.picked_found(differs);
                 for r in &plan.ranges {
                     let copy = Arc::as_ptr(&r.shadow) as usize;
                     for p in 0..r.span.pieces {
                         let at = (r.at + p) as usize;
-                        let flagged = !r.compared || differs.get(at).is_none_or(|&d| d != 0);
+                        let flagged = !r.compared || differs.get(at).is_none_or(|&d| torn::flagged(d));
                         if flagged
                             && r.compared
                             && let Some((_, count)) = region
