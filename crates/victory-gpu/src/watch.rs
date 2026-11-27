@@ -97,11 +97,18 @@ fn next_asking() -> u64 {
     ASKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
+/// Monotonic epoch of the most recent `Journal::note` call across all ranges.
+/// Used by `Tracked::take` to skip scanning `Journal::written` when a full
+/// range is still `published` and no new journal writes have occurred since
+/// the last full-range `take`.
+static JOURNAL_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// A title-memory range whose changed pages another subsystem needs to read.
 pub(crate) struct Tracked {
     start: usize,
     end: usize,
     seen: Mutex<BTreeMap<usize, u64>>,
+    full_seen: std::sync::atomic::AtomicU64,
 }
 
 /// Tracks a runtime GPU-memory range, including physical-page views when
@@ -115,6 +122,7 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
         start,
         end,
         seen: Mutex::default(),
+        full_seen: std::sync::atomic::AtomicU64::new(0),
     })
 }
 
@@ -734,6 +742,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         for &(page, parts) in &pages {
             j.note(page, parts, now);
         }
+        JOURNAL_EPOCH.fetch_max(now, std::sync::atomic::Ordering::Release);
         (now, of(&j))
     };
     // Noted: what the guards made clean of it is known by its bits from
@@ -778,7 +787,17 @@ impl Tracked {
         if from >= to {
             return Vec::new();
         }
-        let Some((_, pages)) = writes(from, to, true) else {
+        let full = from == self.start && to == self.end;
+        if full {
+            let last_full = self.full_seen.load(std::sync::atomic::Ordering::Acquire);
+            if last_full != 0
+                && JOURNAL_EPOCH.load(std::sync::atomic::Ordering::Acquire) <= last_full
+                && published(from, to)
+            {
+                return Vec::new();
+            }
+        }
+        let Some((now, pages)) = writes(from, to, true) else {
             return Vec::new();
         };
         let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
@@ -795,6 +814,9 @@ impl Tracked {
                 seen.insert(page, write);
             }
             new.push((page, last.unwrap_or(0)));
+        }
+        if full {
+            self.full_seen.store(now, std::sync::atomic::Ordering::Release);
         }
         // Of a page taken before, the parts written since, where they are
         // known (`VICTORY_TAKE_PARTS=0`: the page).
