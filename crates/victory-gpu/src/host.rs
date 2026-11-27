@@ -5240,6 +5240,9 @@ impl Host {
         let gathering = std::time::Instant::now();
         let plain: Vec<&CardPlan> = if inflight_fetch() { plans.iter().map(|(p, _)| *p).collect() } else { Vec::new() };
         let staged = if inflight_fetch() { self.relay_card_inflight(&plain, fetch) } else { None };
+        let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
+        let mut total = 0u64;
+        let mut from_left = false;
         if inflight_fetch() {
             inflight_regions_landed(&plain);
             if let Some(left) = staged {
@@ -5248,17 +5251,22 @@ impl Host {
                     return;
                 }
                 INFLIGHT_STATS[3].fetch_add(1, Ordering::Relaxed);
+                for (shadow, lo, hi) in left {
+                    pieces.push((shadow, lo, hi, total));
+                    total += (hi - lo) as u64;
+                }
+                from_left = true;
             }
         }
-        let differs = {
-            let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
-            work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
-        };
-        let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
-        let mut total = 0u64;
         if let (Some(fetch), Some(first)) = (fetch.as_mut(), plans.iter().map(|p| p.1).min()) {
             fetch.had.landing(first);
         }
+        let differs = if from_left {
+            None
+        } else {
+            let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
+            work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
+        };
         // SAFETY: the mapping of the results. The compares of these plans
         // have run, and their dwords are given to no other plan before these
         // are done with (`card_done`).
@@ -5619,7 +5627,7 @@ impl Host {
                     let copy = Arc::as_ptr(&r.shadow) as usize;
                     for p in 0..r.span.pieces {
                         let piece = r.span.first + p;
-                        if !fetched.contains(&(copy, piece)) {
+                        if fetched.binary_search(&(copy, piece)).is_err() {
                             continue;
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
