@@ -1742,7 +1742,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             }
         }
         // The levels views show ([`held_only`]), those of the slots shaders
-        // pick by index among them.
+        // pick by index among them, plus optional `VICTORY_MAX_TEXTURE_DIM` cap.
         let mut base = 0;
         if shape_fits && r.host.placed.load(Relaxed) && held_only() && alias_of(this).is_none() {
             let wanted = r.host.wanted.load(Relaxed);
@@ -1750,6 +1750,14 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             let first = wanted.min(viewed);
             if first != u32::MAX {
                 base = base_level(&r.desc, first);
+            }
+            let cap_level = crate::tiles::min_allowed_level(
+                r.desc.width,
+                r.desc.height,
+                u32::from(r.desc.mip_levels),
+            );
+            if cap_level > 0 {
+                base = base.max(base_level(&r.desc, cap_level));
             }
         }
         let texture = match texture {
@@ -2841,6 +2849,8 @@ fn hand_out_resource(
 ) -> HRESULT {
     #[cfg(not(windows))]
     let _ = (state, clear);
+    #[cfg(windows)]
+    let is_placed = matches!(backing, Backing::Placed { .. });
     let resource = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS),
         desc,
@@ -2857,7 +2867,7 @@ fn hand_out_resource(
             used: std::sync::atomic::AtomicU64::new(0),
             refused: std::sync::atomic::AtomicBool::new(false),
             gone: std::sync::atomic::AtomicBool::new(false),
-            placed: std::sync::atomic::AtomicBool::new(false),
+            placed: std::sync::atomic::AtomicBool::new(is_placed),
             wanted: std::sync::atomic::AtomicU32::new(u32::MAX),
             grown: std::sync::atomic::AtomicBool::new(false),
         },
