@@ -177,6 +177,18 @@ pub(crate) fn native_graphics_state(state_b: &[u8]) -> Option<GraphicsState> {
     Some(g)
 }
 
+/// Extract the 16-byte source-container identity carried by a native
+/// graphics stage's records blob.  Native slot 0x1c8 uses the same terminal
+/// `0x43` record convention as the game's shader containers; the stage block
+/// position is not a reliable vertex/pixel/mesh discriminator.
+pub(crate) fn native_graphics_stage_hash(records: &[u8]) -> Option<[u8; 16]> {
+    records
+        .windows(17)
+        .rev()
+        .find(|bytes| bytes[0] == 0x43)
+        .map(|bytes| bytes[1..].try_into().expect("17-byte window"))
+}
+
 /// Integer render target formats: D3D12 cannot blend into them.
 fn integer_format(f: DXGI_FORMAT) -> bool {
     matches!(
@@ -1695,5 +1707,14 @@ mod tests {
         assert_eq!(g.depth_format, DXGI_FORMAT_D32_FLOAT);
         assert_eq!(g.inputs.len(), 1);
         assert_eq!(g.inputs[0].Format, DXGI_FORMAT_R32G32B32_FLOAT);
+    }
+
+    #[test]
+    fn native_stage_records_extract_terminal_identity() {
+        let mut records = vec![0u8; 32];
+        records.extend_from_slice(&[0x43]);
+        records.extend_from_slice(&[0xabu8; 16]);
+        assert_eq!(native_graphics_stage_hash(&records), Some([0xab; 16]));
+        assert_eq!(native_graphics_stage_hash(&[0x43, 1, 2]), None);
     }
 }
