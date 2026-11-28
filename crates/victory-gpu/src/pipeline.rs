@@ -139,6 +139,8 @@ pub(crate) struct Shader {
     pub(crate) ambient: Option<crate::ambient::Role>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    #[cfg(windows)]
+    pub(crate) digest: Option<[u8; 16]>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -177,7 +179,7 @@ pub(crate) fn kept() -> [u64; 7] {
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
-    shaders
+    let shader = shaders
         .get_or_insert_with(HashMap::new)
         .entry(*full.as_bytes())
         .or_insert_with(|| {
@@ -191,9 +193,15 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(windows)]
+                digest: console::container_digest(bytes),
             })
         })
-        .clone()
+        .clone();
+    drop(shaders);
+    #[cfg(windows)]
+    console::file(&shader);
+    shader
 }
 
 /// A translated shader and the console resources its code reads.
@@ -1068,6 +1076,8 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
+#[cfg(windows)]
+pub(crate) mod console;
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]

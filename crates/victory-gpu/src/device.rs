@@ -462,6 +462,15 @@ extern "system" fn dispatch_218(
             .ok()
             .is_some_and(|v| v.trim() == "1")
     }) {
+        #[cfg(windows)]
+        if std::env::var("VICTORY_PIPELINES_X").ok().is_some_and(|v| v.trim() == "1") {
+            if let Some(result) = pipeline::console::try_compute(desc.cast(), iid, out) {
+                return result.unwrap_or_else(|why| {
+                    tracing::warn!(error = why, "0x218 selective pipeline refused; preserving standard fallback");
+                    crate::object::E_NOTIMPL
+                });
+            }
+        }
         pipeline::create_precompiled_compute(this, desc, iid, out)
     } else {
         unknown_pipeline::<0x218>(this, desc.cast(), iid, out)
