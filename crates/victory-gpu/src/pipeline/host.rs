@@ -91,6 +91,92 @@ impl Default for GraphicsState {
     }
 }
 
+/// Decode the fixed-state/input-layout blob carried by Xbox slot 0x1c8.
+///
+/// The native graphics library stores this as a compact, little-endian
+/// record (state-B): render-target formats at 0x10, sample mask at 0x1c,
+/// DSV/topology/sample count at 0x24..0x28, followed by length-prefixed
+/// semantic names and six u32 fields per input element at 0x50.  Keeping the
+/// decoder separate from pipeline creation lets malformed records continue to
+/// use the ordinary fallback instead of producing a partially initialized PSO.
+pub(crate) fn native_graphics_state(state_b: &[u8]) -> Option<GraphicsState> {
+    if state_b.len() < 0x50 {
+        return None;
+    }
+    let u32_at = |at: usize| -> Option<u32> {
+        let bytes = state_b.get(at..at.checked_add(4)?)?;
+        Some(u32::from_le_bytes(bytes.try_into().ok()?))
+    };
+    let rt_count = *state_b.get(0x25)? as usize;
+    if rt_count > 8 {
+        return None;
+    }
+    let topology = match state_b[0x26] & 0x0f {
+        0 => D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED,
+        1 => D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT,
+        2 => D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE,
+        3 => D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+        4 => D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH,
+        _ => return None,
+    };
+    let sample_count = state_b[0x28].max(1) as u32;
+    let count = u32_at(0x4c)? as usize;
+    if count > 32 {
+        return None;
+    }
+    let mut g = GraphicsState::default();
+    g.sample_mask = u32_at(0x1c)?;
+    g.topology = topology;
+    g.samples = DXGI_SAMPLE_DESC { Count: sample_count, Quality: 0 };
+    g.depth_format = DXGI_FORMAT(state_b[0x24] as i32);
+    g.targets.NumRenderTargets = rt_count as u32;
+    for i in 0..rt_count {
+        g.targets.RTFormats[i] = DXGI_FORMAT(state_b[0x10 + i] as i32);
+    }
+    let mut at = 0x50;
+    for _ in 0..count {
+        let name_len = u32_at(at)? as usize;
+        at = at.checked_add(4)?;
+        if !(2..=256).contains(&name_len) || at.checked_add(name_len + 24)? > state_b.len() {
+            return None;
+        }
+        let name_bytes = state_b.get(at..at + name_len)?;
+        if name_bytes.last().copied() != Some(0) || name_bytes[..name_len - 1].contains(&0) {
+            return None;
+        }
+        let name = std::ffi::CString::new(&name_bytes[..name_len - 1]).ok()?;
+        at += name_len;
+        let semantic_index = u32_at(at)?;
+        let format = u32_at(at + 4)?;
+        let input_slot = u32_at(at + 8)?;
+        let aligned = u32_at(at + 12)?;
+        let classification = u32_at(at + 16)?;
+        let step_rate = u32_at(at + 20)?;
+        at += 24;
+        let leaked_name = name;
+        g.inputs.push(D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: PCSTR(leaked_name.as_ptr().cast()),
+            SemanticIndex: semantic_index,
+            Format: DXGI_FORMAT(format as i32),
+            InputSlot: input_slot,
+            AlignedByteOffset: aligned,
+            InputSlotClass: if classification == 0 {
+                D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA
+            } else {
+                D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA
+            },
+            InstanceDataStepRate: step_rate,
+        });
+        g.names.push(leaked_name);
+    }
+    // Repoint semantic names into the owned CString vector.  The temporary
+    // pointers above are never exposed before this function returns.
+    for (input, name) in g.inputs.iter_mut().zip(&g.names) {
+        input.SemanticName = PCSTR(name.as_ptr().cast());
+    }
+    Some(g)
+}
+
 /// Integer render target formats: D3D12 cannot blend into them.
 fn integer_format(f: DXGI_FORMAT) -> bool {
     matches!(
@@ -1584,5 +1670,30 @@ mod tests {
             element(DXGI_FORMAT_R32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT),
         ];
         let _ = offsets(&inputs);
+    }
+
+    #[test]
+    fn native_state_b_decodes_formats_and_input_layout() {
+        let mut b = vec![0u8; 0x50 + 4 + 9 + 24];
+        b[0x10] = DXGI_FORMAT_R8G8B8A8_UNORM.0 as u8;
+        b[0x24] = DXGI_FORMAT_D32_FLOAT.0 as u8;
+        b[0x25] = 1;
+        b[0x26] = 3;
+        b[0x28] = 1;
+        b[0x4c..0x50].copy_from_slice(&1u32.to_le_bytes());
+        b[0x50..0x54].copy_from_slice(&9u32.to_le_bytes());
+        b[0x54..0x5d].copy_from_slice(b"POSITION\0");
+        b[0x5d..0x61].copy_from_slice(&0u32.to_le_bytes());
+        b[0x61..0x65].copy_from_slice(&(DXGI_FORMAT_R32G32B32_FLOAT.0 as u32).to_le_bytes());
+        b[0x65..0x69].copy_from_slice(&0u32.to_le_bytes());
+        b[0x69..0x6d].copy_from_slice(&0u32.to_le_bytes());
+        b[0x6d..0x71].copy_from_slice(&0u32.to_le_bytes());
+        b[0x71..0x75].copy_from_slice(&0u32.to_le_bytes());
+        let g = native_graphics_state(&b).expect("valid native state B");
+        assert_eq!(g.targets.NumRenderTargets, 1);
+        assert_eq!(g.targets.RTFormats[0], DXGI_FORMAT_R8G8B8A8_UNORM);
+        assert_eq!(g.depth_format, DXGI_FORMAT_D32_FLOAT);
+        assert_eq!(g.inputs.len(), 1);
+        assert_eq!(g.inputs[0].Format, DXGI_FORMAT_R32G32B32_FLOAT);
     }
 }
