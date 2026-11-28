@@ -61,7 +61,9 @@ const SHARED_DEFAULTS: &[(&str, &str)] = &[
     // would be (the prison cell, texlogs/least, 2026-11-28).
     ("VICTORY_AMBIENT_LEAST", "0.12"),
     ("VICTORY_VIDEO_BUDGET_MB", "5500"),
-    ("VICTORY_TEXTURE_NO_WAIT", "1"),
+    // Off: a refresh that went on while the title remapped its memory filled
+    // textures with what lay there (the prison walls blotched, 2026-11-28).
+    ("VICTORY_TEXTURE_NO_WAIT", "0"),
     ("VICTORY_TEXTURE_BACK", "1"),
     ("VICTORY_TEXTURE_PAGES", "1"),
     ("VICTORY_INDIRECT_GATHER", "1"),

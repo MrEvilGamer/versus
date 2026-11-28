@@ -847,14 +847,50 @@ pub(crate) extern "system" fn allocation_info(
     out
 }
 
-/// The newer description: the plain one, then a sampler feedback mip
-/// region (width, height, depth).
+/// The newer description: the plain one's fields, then a sampler feedback
+/// mip region (width, height, depth) right after the flags, in the 4 bytes
+/// the plain one ends with as padding: 64 bytes, as the GDK's
+/// `D3D12_RESOURCE_DESC1` (gen9 `d3d12_xs.h`), not the 72 of a plain
+/// description with the region after it. An array of them is read at that
+/// stride (VIctory-NVIDIA #882: the second and later descriptions of
+/// method 0x360 were read 8 bytes off).
 #[repr(C)]
 pub(crate) struct ResourceDesc1 {
-    desc: ResourceDesc,
+    dimension: u32,
+    alignment: u64,
+    width: u64,
+    height: u32,
+    depth_or_array_size: u16,
+    mip_levels: u16,
+    format: u32,
+    sample_count: u32,
+    sample_quality: u32,
+    layout: u32,
+    flags: u32,
     mip_region: [u32; 3],
 }
-const _: () = assert!(size_of::<ResourceDesc1>() == 72);
+const _: () = assert!(size_of::<ResourceDesc1>() == 64);
+const _: () = assert!(std::mem::offset_of!(ResourceDesc1, flags) == 48);
+const _: () = assert!(std::mem::offset_of!(ResourceDesc1, mip_region) == 52);
+
+impl ResourceDesc1 {
+    /// The plain description it starts with.
+    fn plain(&self) -> ResourceDesc {
+        ResourceDesc {
+            dimension: self.dimension,
+            alignment: self.alignment,
+            width: self.width,
+            height: self.height,
+            depth_or_array_size: self.depth_or_array_size,
+            mip_levels: self.mip_levels,
+            format: self.format,
+            sample_count: self.sample_count,
+            sample_quality: self.sample_quality,
+            layout: self.layout,
+            flags: self.flags,
+        }
+    }
+}
 
 /// Where one resource goes in [`allocation_info2`]'s placement.
 #[repr(C)]
@@ -880,7 +916,8 @@ pub(crate) extern "system" fn allocation_info2(
         // SAFETY: the title passes `count` descriptions.
         unsafe { std::slice::from_raw_parts(descs, count as usize) }
     };
-    let total = place(descs.iter().map(|d| &d.desc), |i, info| {
+    let plain: Vec<ResourceDesc> = descs.iter().map(ResourceDesc1::plain).collect();
+    let total = place(plain.iter(), |i, info| {
         if !each.is_null() {
             // SAFETY: the title passes room for `count` entries.
             unsafe { each.add(i).write(info) };

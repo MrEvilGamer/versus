@@ -43,7 +43,10 @@ impl Fields {
             _ => u32::from(compares),
         };
         let filter = if aniso {
-            0x55
+            // Anisotropic with point mips where the console asks for them and
+            // the host has it (`D3D12_OPTIONS19`), as static samplers do;
+            // else linear mips (Marvisak/VIctory 94c1ead4, #2031).
+            0x54 | u32::from(self.mip == 2 || !aniso_point_mip())
         } else {
             linear(self.min) << 4 | linear(self.mag) << 2 | u32::from(self.mip == 2)
         };
@@ -80,6 +83,26 @@ impl Fields {
             MaxLOD: max_lod,
         }
     }
+}
+
+/// Whether the host GPU filters anisotropically with point mips
+/// (`D3D12_OPTIONS19`): asked once; no host or an older runtime means no.
+fn aniso_point_mip() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let Some(host) = crate::host::host() else { return false };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+        // SAFETY: the feature query writes the structure of the given size.
+        unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS19,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .is_ok()
+            && options.AnisoFilterWithPointMipSupported.as_bool()
+    })
 }
 
 /// Maps a console address mode (`1..=5`) to host D3D12, falling back to `CLAMP`.

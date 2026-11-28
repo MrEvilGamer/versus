@@ -673,6 +673,36 @@ pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(
 pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
+/// A shader-visible sampler heap of ours with a point sampler in slot 0,
+/// bound when the title binds no sampler heap (see `bind`).
+fn own_sampler_heap() -> Option<&'static ID3D12DescriptorHeap> {
+    static HEAP: std::sync::OnceLock<Option<ID3D12DescriptorHeap>> = std::sync::OnceLock::new();
+    HEAP.get_or_init(|| {
+        let device = &crate::host::host()?.device;
+        let desc = D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+            NumDescriptors: 1,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+            NodeMask: 0,
+        };
+        // SAFETY: plain creation.
+        let heap: ID3D12DescriptorHeap = unsafe { device.CreateDescriptorHeap(&desc) }.ok()?;
+        let sampler = D3D12_SAMPLER_DESC {
+            Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            MaxLOD: f32::MAX,
+            ..Default::default()
+        };
+        // SAFETY: a live heap with room for one sampler.
+        unsafe { device.CreateSampler(&sampler, heap.GetCPUDescriptorHandleForHeapStart()) };
+        tracing::info!("a sampler heap of ours, for lists the title binds none in (Marvisak e53474cd)");
+        Some(heap)
+    })
+    .as_ref()
+}
+
 /// Marks the last traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
 fn dropped(pipeline: usize) {
@@ -1460,13 +1490,23 @@ impl State {
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
         if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
+            let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = self
                 .heaps
                 .iter()
                 .filter(|&&h| h != 0)
                 .filter_map(|&h| crate::descriptor::heap(h as This).host())
                 .map(|h| Some(h.heap.clone()))
                 .collect();
+            // Every root signature we make indexes the sampler heap directly,
+            // and one must be bound before such a signature is set (debug
+            // layer 1419; NVIDIA removes the device with INVALID_CALL): when
+            // the title binds none, one of ours with a point sampler
+            // (Marvisak/VIctory e53474cd, #1778).
+            if self.heaps[1] == 0
+                && let Some(own) = own_sampler_heap()
+            {
+                heaps.push(Some(own.clone()));
+            }
             heaps.iter().flatten().for_each(|h| list.keep(h));
             // SAFETY: an open list and shader-visible heaps.
             unsafe { l.SetDescriptorHeaps(&heaps) };

@@ -750,7 +750,10 @@ fn pbits(mode: u16) -> bool {
 /// alpha). After fxceless/victory-fork 06702fe8 (upstream VIctory #3111),
 /// as carried in VIctory-NVIDIA 6726920.
 fn rotation(ctrl: u16) -> usize {
-    if matches!(ctrl & 7, 4 | 5) { usize::from(ctrl >> 3 & 3) } else { 0 }
+    // `VICTORY_BC7_ROTATION=old`: bits 4:3 in every mode, as before (A/B).
+    static OLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let old = *OLD.get_or_init(|| std::env::var("VICTORY_BC7_ROTATION").is_ok_and(|v| v == "old"));
+    if old || matches!(ctrl & 7, 4 | 5) { usize::from(ctrl >> 3 & 3) } else { 0 }
 }
 
 /// Channel precisions: the p-bit is red's lowest bit; rotation swaps alpha
