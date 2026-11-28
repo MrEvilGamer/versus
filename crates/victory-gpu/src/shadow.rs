@@ -237,6 +237,7 @@ fn card_limits() -> (u64, u64) {
         if card_all() {
             min_bytes = 0;
         }
+        let (min_bytes, max_bytes) = small_card_limits(vram_budget, min_bytes, max_bytes);
         tracing::info!(
             vram_budget_mb = vram_budget.map(|b| b >> 20),
             card_buffers_min_kb = min_bytes >> 10,
@@ -245,6 +246,45 @@ fn card_limits() -> (u64, u64) {
         );
         (min_bytes, max_bytes)
     })
+}
+
+/// On a card whose budget is under 10 GiB (8 GB cards) the limits asked
+/// for may not go past the defaults chosen from that budget
+/// ([`default_card_limits_mb`]: copies from 16 MiB up, 512 MiB of them):
+/// the NVIDIA profile's 1 MiB / 1,024 MiB put 880 MB of buffer copies on
+/// an RTX 4060 Ti 8 GB whose budget falls to ~6,800 MB in the world, with
+/// 3 GB of render targets beside them, and textures waited for room the
+/// whole run (texlogs/before; VIctory-NVIDIA #890 measured the same on an
+/// RTX 5070 Laptop 8 GB: faces missing until the floor was kept).
+/// `VICTORY_CARD_BUFFERS_SMALL_CARD=0`: as asked.
+fn small_card_limits(vram_budget: Option<u64>, min_bytes: u64, max_bytes: u64) -> (u64, u64) {
+    const TEN_GIB: u64 = 10 << 30;
+    const MIB: u64 = 1 << 20;
+    let Some(budget) = vram_budget.filter(|&b| b < TEN_GIB) else {
+        return (min_bytes, max_bytes);
+    };
+    if std::env::var_os("VICTORY_CARD_BUFFERS_SMALL_CARD").is_some_and(|v| v == "0") {
+        return (min_bytes, max_bytes);
+    }
+    let (default_min, default_max) = default_card_limits_mb(Some(budget));
+    let kept = (min_bytes.max(default_min * MIB), max_bytes.min(default_max * MIB));
+    if kept != (min_bytes, max_bytes) {
+        tracing::warn!(
+            vram_budget_mb = budget >> 20,
+            asked_min_kb = min_bytes >> 10,
+            asked_max_mb = max_bytes >> 20,
+            kept_min_kb = kept.0 >> 10,
+            kept_max_mb = kept.1 >> 20,
+            "card buffer limits kept to the small card's defaults (VICTORY_CARD_BUFFERS_SMALL_CARD=0: as asked)"
+        );
+    }
+    kept
+}
+
+/// The bytes of copies' card sides alive now, with their "before" twins
+/// (for the VRAM census).
+pub(crate) fn card_bytes_alive() -> u64 {
+    CARD_BYTES[0].load(Ordering::Relaxed) + CARD_BYTES[1].load(Ordering::Relaxed)
 }
 
 /// Bytes alive of copies' card sides, and of their "before" twins.

@@ -92,6 +92,21 @@ fn parse(set: &str) -> Set {
     }
 }
 
+/// `VICTORY_AMBIENT_LEAST=<level>`: with the estimate, the least indirect
+/// light a point gets (0: no floor, the default). The estimate is made from
+/// what is on screen, so in unlit rooms it is about nothing and what no lamp
+/// reaches is black (the prison cell, 2026-11-28).
+fn least() -> f32 {
+    static LEAST: OnceLock<f32> = OnceLock::new();
+    *LEAST.get_or_init(|| {
+        std::env::var("VICTORY_AMBIENT_LEAST")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .map_or(0.0, |v| v.min(4.0))
+    })
+}
+
 fn set() -> Set {
     static SET: OnceLock<Set> = OnceLock::new();
     *SET.get_or_init(|| parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()))
@@ -137,7 +152,7 @@ const SOURCE: &str = r#"
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
-    float follow; float most; float air; float unused;
+    float follow; float most; float air; float least;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -326,6 +341,12 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float top = max(dot(found, LUMA) * most, 1e-6);
     float has = dot(was, LUMA);
     was *= min(1.0, top / max(has, 1e-6));
+    // Never under the least light asked for (`VICTORY_AMBIENT_LEAST`):
+    // what no lamp's bounce reaches (the title's traced light is not
+    // there) is otherwise black. After the bound above, which stays the
+    // estimate's (VIctory-NVIDIA #475, after edsuuu/VI-BR-PORT 849a20b3).
+    float3 floor_light = float3(1.0, 0.98, 0.94) * least * open;
+    if (least > 0.0 && dot(found, LUMA) < dot(floor_light, LUMA)) found = floor_light;
     light[p] = pack(max(was, found));
 }
 #endif
@@ -461,6 +482,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[8] = 0.04f32.to_bits();
     words[9] = 4.0f32.to_bits();
     words[10] = air().to_bits();
+    words[11] = least().to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states

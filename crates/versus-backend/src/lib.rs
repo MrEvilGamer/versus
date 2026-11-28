@@ -49,7 +49,17 @@ fn detect_ram_gb() -> u64 {
 /// Safe shared defaults for all NVIDIA GPUs (match upstream avatarmanz safe paths).
 const SHARED_DEFAULTS: &[(&str, &str)] = &[
     ("VICTORY_NO_WATCHDOG", "1"),
-    ("VICTORY_LEVELS_ON_DEMAND", "1"),
+    // Off: the known-good texture path (launch-versus-648.bat). On an RTX
+    // 4060 Ti 8 GB with levels on demand and the texture pool on, 393 to
+    // 5,003 textures waited for memory in the world and the pool's blocks
+    // kept 1-1.5 GB of gaps; with both off 14 waited and the card stayed
+    // under its budget (texlogs/nopool, 2026-11-28).
+    ("VICTORY_LEVELS_ON_DEMAND", "0"),
+    ("VICTORY_TEXTURE_POOL", "0"),
+    // The least indirect light with the ambient stand-in on (VICTORY_AMBIENT):
+    // without it unlit interiors are black where the title's traced light
+    // would be (the prison cell, texlogs/least, 2026-11-28).
+    ("VICTORY_AMBIENT_LEAST", "0.12"),
     ("VICTORY_VIDEO_BUDGET_MB", "5500"),
     ("VICTORY_TEXTURE_NO_WAIT", "1"),
     ("VICTORY_TEXTURE_BACK", "1"),

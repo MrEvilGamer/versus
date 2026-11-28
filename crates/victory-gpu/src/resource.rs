@@ -1369,6 +1369,299 @@ pub(crate) fn want_level(this: This, first: u32) {
     }
 }
 
+/// Every ten seconds (`VICTORY_VRAM_CENSUS=0`: never), where the card's
+/// memory goes, texture by texture, in four lines:
+/// - "vram census": the system's budget and use; host copies the host
+///   renders to or writes (targets, depth, unordered access) and those the
+///   title fills, by count and MB; of each, those idle 10 s and 60 s, those
+///   whose title memory is unmapped (dead) and those that share their title
+///   memory with another copy; twins; the pool's blocks, their fill in
+///   tenths, draining blocks and resting bytes; buffer copies on the card;
+///   what else the process holds on the card (the system's use less all of
+///   that); and the change of each since the last census (growth: leaks).
+/// - "vram census, targets": the 16 largest groups of targets by size,
+///   format and kind, each with count, MB and how many are idle.
+/// - "vram census, filled": title textures by size class.
+/// - "vram census, made": buffers the host made since the start by kind.
+#[cfg(windows)]
+fn vram_census() {
+    use std::collections::HashMap;
+    use std::sync::atomic::Ordering::Relaxed;
+    #[derive(Default, Clone, Copy)]
+    struct Tally {
+        n: u64,
+        bytes: u64,
+        idle10: u64,
+        idle60: u64,
+        dead: u64,
+        dupes: u64,
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_VRAM_CENSUS").is_none_or(|v| v != "0")) {
+        return;
+    }
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    if now.saturating_sub(LAST.load(Relaxed)) < 10_000 {
+        return;
+    }
+    LAST.store(now, Relaxed);
+    let began = std::time::Instant::now();
+    let mb = |b: u64| b >> 20;
+    let (mut targets, mut filled, mut twins) = (Tally::default(), Tally::default(), 0u64);
+    // (width, height, format, kind) -> (count, bytes, idle 10 s)
+    let mut groups: HashMap<(u64, u32, u32, &'static str), (u64, u64, u64)> = HashMap::new();
+    // Size classes of filled textures: under 64 KiB, 1 MiB, 16 MiB, more.
+    let mut classes = [(0u64, 0u64); 4];
+    let mut at_memory: HashMap<usize, u32> = HashMap::new();
+    {
+        let all = textures();
+        for &at in all.iter() {
+            // SAFETY: as in `let_go_idle`.
+            let r = unsafe { &*(at as *const Resource) };
+            let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            let Some((host, twin)) = made.as_ref() else { continue };
+            let bytes = host.bytes;
+            twins += twin.as_ref().map_or(0, |t| t.colour.bytes);
+            let used = r.host.used.load(Relaxed);
+            let idle10 = used != 0 && crate::host::long_ago(used, 10_000, 8);
+            let idle60 = used != 0 && crate::host::long_ago(used, 60_000, 8);
+            let placed = r.host.placed.load(Relaxed);
+            let data = r.data() as usize;
+            let dead = placed && !crate::texture::committed(r.data().cast_const(), 1);
+            let dupe = placed && {
+                let seen = at_memory.entry(data).or_insert(0);
+                *seen += 1;
+                *seen > 1
+            };
+            let t = if host.filled { &mut filled } else { &mut targets };
+            t.n += 1;
+            t.bytes += bytes;
+            t.idle10 += u64::from(idle10) * bytes;
+            t.idle60 += u64::from(idle60) * bytes;
+            t.dead += u64::from(dead) * bytes;
+            t.dupes += u64::from(dupe) * bytes;
+            if host.filled {
+                let class = match bytes {
+                    0..0x1_0000 => 0,
+                    0x1_0000..0x10_0000 => 1,
+                    0x10_0000..0x100_0000 => 2,
+                    _ => 3,
+                };
+                classes[class].0 += 1;
+                classes[class].1 += bytes;
+            } else {
+                let f = r.desc.flags;
+                let kind = if f & 2 != 0 {
+                    "depth"
+                } else if f & 1 != 0 && f & 4 != 0 {
+                    "target+uav"
+                } else if f & 1 != 0 {
+                    "target"
+                } else if f & 4 != 0 {
+                    "uav"
+                } else {
+                    "other"
+                };
+                let g = groups.entry((r.desc.width, r.desc.height, r.desc.format, kind)).or_default();
+                g.0 += 1;
+                g.1 += bytes;
+                g.2 += u64::from(idle10);
+            }
+        }
+    }
+    let memory = crate::host::host().and_then(|h| h.video_memory()).unwrap_or_default();
+    let (tenths, draining, resting) = crate::pool::census();
+    let blocks = crate::pool::texture_block_bytes();
+    let card_copies = crate::shadow::card_bytes_alive();
+    let in_blocks = filled.bytes.min(blocks);
+    let accounted = targets.bytes + twins + blocks + filled.bytes.saturating_sub(in_blocks) + card_copies;
+    let other = memory[1].saturating_sub(accounted);
+    static PREVIOUS: std::sync::Mutex<[u64; 6]> = std::sync::Mutex::new([0; 6]);
+    let current = [memory[1], targets.bytes, filled.bytes, blocks, card_copies, other];
+    let delta = {
+        let mut previous = PREVIOUS.lock().unwrap_or_else(|e| e.into_inner());
+        let d = [0, 1, 2, 3, 4, 5].map(|i| mb(current[i]) as i64 - mb(previous[i]) as i64);
+        *previous = current;
+        d
+    };
+    tracing::info!(
+        "vram census: card {} MB in use of a budget of {} MB (PC memory shared with it {} MB); targets/depth/uav copies {} = {} MB (idle 10 s {} MB, 60 s {} MB, dead {} MB, sharing title memory {} MB); twins {} MB; title-filled copies {} = {} MB (idle 10 s {} MB, 60 s {} MB, dead {} MB, sharing title memory {} MB); texture blocks {} MB = {} MB filled + {} MB gaps (blocks by fill in tenths 0..10: {:?}, draining {}, resting {} MB); buffer copies on the card {} MB; everything else {} MB; change since last census, MB: use {:+}, targets {:+}, filled {:+}, blocks {:+}, buffer copies {:+}, else {:+}; took {} ms",
+        mb(memory[1]),
+        mb(memory[0]),
+        mb(memory[3]),
+        targets.n,
+        mb(targets.bytes),
+        mb(targets.idle10),
+        mb(targets.idle60),
+        mb(targets.dead),
+        mb(targets.dupes),
+        mb(twins),
+        filled.n,
+        mb(filled.bytes),
+        mb(filled.idle10),
+        mb(filled.idle60),
+        mb(filled.dead),
+        mb(filled.dupes),
+        mb(blocks),
+        mb(in_blocks),
+        mb(blocks.saturating_sub(in_blocks)),
+        tenths,
+        draining,
+        mb(resting),
+        mb(card_copies),
+        mb(other),
+        delta[0],
+        delta[1],
+        delta[2],
+        delta[3],
+        delta[4],
+        delta[5],
+        began.elapsed().as_millis(),
+    );
+    let mut sorted: Vec<_> = groups.into_iter().collect();
+    sorted.sort_unstable_by_key(|(_, (_, bytes, _))| std::cmp::Reverse(*bytes));
+    let top: Vec<String> = sorted
+        .iter()
+        .take(16)
+        .map(|((w, h, f, kind), (n, bytes, idle))| format!("{w}x{h} f{f} {kind}: {n} = {} MB ({idle} idle)", mb(*bytes)))
+        .collect();
+    tracing::info!("vram census, targets by size, format and kind ({} groups): {}", sorted.len(), top.join("; "));
+    tracing::info!(
+        "vram census, filled by size: under 64 KiB {} = {} MB (each takes 64 KiB in a block), 64 KiB-1 MiB {} = {} MB, 1-16 MiB {} = {} MB, over 16 MiB {} = {} MB; moved by compaction so far {} = {} MB",
+        classes[0].0,
+        mb(classes[0].1),
+        classes[1].0,
+        mb(classes[1].1),
+        classes[2].0,
+        mb(classes[2].1),
+        classes[3].0,
+        mb(classes[3].1),
+        RELOCATED[0].load(Relaxed),
+        mb(RELOCATED[1].load(Relaxed)),
+    );
+    let made: Vec<u64> = crate::host::MADE.iter().map(|m| m.load(Relaxed)).collect();
+    tracing::info!(
+        "vram census, made since the start (count, MB): upload buffers {} {}, shared buffers {} {}, card buffers {} {}",
+        made[0],
+        mb(made[1]),
+        made[2],
+        mb(made[3]),
+        made[4],
+        mb(made[5]),
+    );
+}
+
+/// Host copies made again elsewhere by [`relocate_sparse`] since the
+/// start, and their bytes.
+#[cfg(windows)]
+pub(crate) static RELOCATED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Empties the blocks of textures the pool is letting drain
+/// (`pool::evacuating`): the host copies of title-filled textures in them
+/// that no list holds are let go as by [`want_level`] (the slots that show
+/// one go on showing it until the new copy's upload has run) and their
+/// slots made due, so the next pass makes each again, from title memory,
+/// in a fuller block; lists that hold the old one keep it until they are
+/// reset, as with `want_level` (holding out for copies no list held moved
+/// 38 MB in six minutes: textures in use are always in some list). Once a
+/// block's last copy is gone the pool lets it go.
+/// Up to 48 MiB a quarter second, and only while blocks that are not
+/// draining have room for the copy (no new block is made for it).
+/// `VICTORY_TEXTURE_COMPACT=0`: off.
+///
+/// Why: textures are let go one by one (the sweep), never a block at a
+/// time, so blocks stay half full. Run texlogs/diag (RTX 4060 Ti 8 GB):
+/// 3,712 MB of blocks held 1,513 MB of textures while the card stood
+/// 1.2 GB past its budget and every new texture was refused.
+#[cfg(windows)]
+fn relocate_sparse() {
+    use std::sync::atomic::Ordering::Relaxed;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_COMPACT").is_none_or(|v| v != "0")) {
+        return;
+    }
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    if now.saturating_sub(LAST.load(Relaxed)) < 250 {
+        return;
+    }
+    LAST.store(now, Relaxed);
+    const MOST: u64 = 48 << 20;
+    const MARGIN: u64 = 64 << 20;
+    let (mut largest, mut room) = crate::pool::room_outside_draining();
+    if room < MARGIN {
+        return;
+    }
+    let (mut went, mut bytes) = (0u64, 0u64);
+    // Each look starts where the last one ended: a play has over 100,000.
+    static FROM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let all = textures();
+    let from = FROM.load(Relaxed);
+    let mut looked = 0usize;
+    for &at in all.range(from..).chain(all.range(..from)) {
+        looked += 1;
+        if bytes >= MOST || room < MARGIN || looked > 16_384 {
+            FROM.store(at, Relaxed);
+            break;
+        }
+        // SAFETY: a texture leaves the table before it is freed, under the
+        // lock held here (`Drop for Resource`), as in `let_go_idle`.
+        let r = unsafe { &*(at as *const Resource) };
+        if !fills(&r.desc) || crate::texture::host_wrote(at) {
+            continue;
+        }
+        let old = {
+            let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            let movable = made.as_ref().is_some_and(|(host, twin)| {
+                twin.is_none()
+                    && host.tiled.is_none()
+                    && host.bytes > 0
+                    && host.bytes + MARGIN <= room
+                    && host.bytes <= largest
+                    && crate::pool::evacuating(&host.texture)
+            });
+            if !movable {
+                continue;
+            }
+            // Under the lock, as in `want_level`.
+            crate::texture::unstage(at as This);
+            r.host.grown.store(true, Relaxed);
+            made.take()
+        };
+        let Some(old) = old else { continue };
+        let len = old.0.bytes;
+        REPLACED.lock().unwrap_or_else(|e| e.into_inner()).push((crate::host::moment(), old));
+        // Its slots are due again (one not placed is made again at its next
+        // use).
+        if r.host.placed.load(Relaxed)
+            && let Some((data, _)) = texture_memory(at as This)
+        {
+            crate::descriptor::host::remapped(data as usize, 1);
+        }
+        went += 1;
+        bytes += len;
+        room = room.saturating_sub(len);
+        if len >= largest {
+            (largest, room) = crate::pool::room_outside_draining();
+        }
+    }
+    if went > 0 {
+        let n = RELOCATED[0].fetch_add(went, Relaxed) + went;
+        let all_bytes = RELOCATED[1].fetch_add(bytes, Relaxed) + bytes;
+        static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if now.saturating_sub(LOGGED.swap(now, Relaxed)) >= 5000 {
+            tracing::info!(
+                so_far = n,
+                so_far_mb = all_bytes >> 20,
+                now = went,
+                now_kb = bytes >> 10,
+                "texture blocks compacted: host copies in half-empty blocks made again in fuller ones (VICTORY_TEXTURE_COMPACT=0: not)"
+            );
+        }
+    }
+}
+
 /// Counts for the memory line: host copies of textures the title fills
 /// alive and their bytes; such copies let go as idle since the start and
 /// their bytes; made again after that and their bytes; and host copies made
@@ -1861,7 +2154,14 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     if filled < floor {
         return true;
     }
-    if crate::ggvl_bridge::vram_under_pressure() {
+    // GGVL's pressure (on past 92 % of the budget, off only under 82 %) is
+    // not asked here: the line below already keeps the card under its
+    // share of the budget, and the pressure's hysteresis held the queue
+    // shut between 82 and 90 % for the rest of the run (2,169 textures
+    // waiting at 6,120 of 6,610 MB, texlogs/room96: the cell's poster and
+    // table). Without a budget the pressure still decides.
+    if memory.is_none() && crate::ggvl_bridge::vram_under_pressure() {
+        note_room(false, "the card's memory is under pressure (GGVL)", memory, filled, floor);
         return false;
     }
     match memory {
@@ -1870,11 +2170,55 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
         Some([budget, used, ..]) => {
-            used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
-                < budget / 100 * room_percent()
+            let room = used.saturating_sub(crate::pool::texture_room())
+                + crate::shadow::card_room_kept()
+                + targets_room_kept()
+                < budget / 100 * room_percent();
+            note_room(room, "the card's budget line", memory, filled, floor);
+            room
         }
         None => filled < WITHOUT_BUDGET,
     }
+}
+
+/// Logs each change of [`room`]'s answer past the floor (at most one line a
+/// second), with the numbers it was taken from: the headroom textures had.
+#[cfg(windows)]
+fn note_room(room: bool, why: &str, memory: Option<[u64; 4]>, filled: u64, floor: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+    static AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if LAST.load(Relaxed) == u8::from(room) {
+        return;
+    }
+    let now = crate::host::now_ms();
+    if now.saturating_sub(AT.load(Relaxed)) < 1000 {
+        return;
+    }
+    AT.store(now, Relaxed);
+    LAST.store(u8::from(room), Relaxed);
+    let [budget, used, ..] = memory.unwrap_or_default();
+    let line = budget / 100 * room_percent();
+    let counted = used.saturating_sub(crate::pool::texture_room())
+        + crate::shadow::card_room_kept()
+        + targets_room_kept();
+    tracing::info!(
+        "texture room {} ({why}, frame {}): budget {} MB, in use {} MB, free in texture blocks {} MB, kept for buffer copies {} MB, kept for render targets {} MB (targets now {} MB), counted {} MB against the line {} MB ({} %); title textures {} MB, floor {} MB; headroom {} MB",
+        if room { "open" } else { "closed" },
+        crate::frame::current(),
+        budget >> 20,
+        used >> 20,
+        crate::pool::texture_room() >> 20,
+        crate::shadow::card_room_kept() >> 20,
+        targets_room_kept() >> 20,
+        target_bytes() >> 20,
+        counted >> 20,
+        line >> 20,
+        room_percent(),
+        filled >> 20,
+        floor >> 20,
+        (line as i64 - counted as i64) >> 20,
+    );
 }
 
 /// The bytes of the card's memory the texture queue leaves free for
@@ -1902,7 +2246,17 @@ pub(crate) fn targets_room_kept() -> u64 {
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
+            .map_or_else(
+                // 3,072 MiB or three tenths of the card's budget, whichever
+                // is less (VIctory-NVIDIA #730): unchanged from 12 GB cards
+                // up; on an 8 GB card (budget 7,181 MB) the flat 3,072 MiB
+                // with the buffer copies' room left textures 1.8-2.2 GB.
+                || {
+                    let budget = crate::host::host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
+                    budget.map_or(3072 << 20, |b| (3072u64 << 20).min(b / 10 * 3))
+                },
+                |mb| mb.min(8192) << 20,
+            )
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
@@ -2216,6 +2570,8 @@ pub(crate) fn let_go_idle() {
             crate::host::retire(made);
         }
     }
+    relocate_sparse();
+    vram_census();
     let memory = crate::host::host().and_then(|h| h.video_memory());
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let keep = *KEEP

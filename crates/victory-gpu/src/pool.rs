@@ -60,8 +60,21 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
     let (reclaimed, draining_count, stats): (Vec<(ID3D12Heap, u64)>, usize, PoolStats) = {
         let mut pool = TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
         let reclaimed = pool.reclaim_empty(keep, finished, now());
+        // Up to sixteen blocks at most 75 % full are emptied at a time
+        // (`resource::relocate_sparse` makes their textures again in the
+        // others): 1.5 to 2.2 GB of the card stood free between textures in
+        // half-empty blocks while new ones were refused (texlogs/diag).
         let draining_count = if under_pressure {
-            pool.select_evacuation_heaps(25, 2)
+            // Blocks with under 1/16 of them still taken count for none: in
+            // texlogs/dred sixteen such blocks (1 GB) held the sixteen places
+            // and no other block was emptied for the rest of the run.
+            let now_draining = pool
+                .blocks
+                .iter()
+                .flatten()
+                .filter(|b| b.draining && b.free.total_free() < TEXTURE_BLOCK - TEXTURE_BLOCK / 16)
+                .count();
+            pool.select_evacuation_heaps(75, 16usize.saturating_sub(now_draining))
         } else {
             pool.clear_evacuation_flags();
             0
@@ -87,6 +100,38 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
             "ggvl: reclaimed empty texture pool VRAM heaps via fence-safe retirement"
         );
     }
+    reclaim_staging(finished);
+}
+
+/// Lets go the empty blocks of staging buffers past [`STAGING_KEPT`].
+///
+/// Nothing did before: the blocks the world's first burst of uploads made
+/// stayed for the whole run. Run texlogs/diag (RTX 4060 Ti 8 GB, 32 GB PC):
+/// 5,248 MB of blocks (82 of 64 MiB, write-combined, counted in the card's
+/// shared memory) held 54 to 123 MB of live staging buffers from the first
+/// world minute on, while the PC had 1.3 GB free and 1.5 GB left to commit
+/// and the card stood 1 GB past its budget, so what the system moved out of
+/// the card had nowhere to go. A block is let go only empty (its pieces are
+/// given back once their lists have run, and rest [`REST`] more) and
+/// through [`crate::host::retire_resource`].
+fn reclaim_staging(finished: u64) {
+    let gone = lock(&STAGING).reclaim_empty(STAGING_KEPT, finished, now());
+    if gone.is_empty() {
+        return;
+    }
+    let n = gone.len() as u64;
+    for Upload(buffer, _) in gone {
+        crate::host::retire_resource(buffer);
+    }
+    static FREED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let total = FREED.fetch_add(n * STAGING_BLOCK, Ordering::Relaxed) + n * STAGING_BLOCK;
+    tracing::info!(
+        blocks = n,
+        freed_mb = (n * STAGING_BLOCK) >> 20,
+        kept_mb = (lock(&STAGING).blocks() as u64 * STAGING_BLOCK) >> 20,
+        freed_since_start_mb = total >> 20,
+        "empty staging blocks let go"
+    );
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
@@ -451,8 +496,29 @@ impl<B: Clone> Pool<B> {
             })
             .collect();
         candidates.sort_unstable();
+        // Only as many as the free space of the blocks that stay can take in,
+        // with 64 MiB to spare for new textures: with sixteen marked at once
+        // the blocks left were the full ones, nothing could move, and 14
+        // blocks under a tenth full stayed for the run (texlogs/census).
+        let draining_occupied: u64 = self
+            .blocks
+            .iter()
+            .flatten()
+            .filter(|b| b.draining)
+            .map(|b| block_size.saturating_sub(b.free.total_free()))
+            .sum();
+        let mut free_staying: u64 = self.blocks.iter().flatten().filter(|b| !b.draining).map(|b| b.free.total_free()).sum();
+        let mut to_move = draining_occupied;
         let mut marked = 0usize;
-        for (_, i) in candidates.into_iter().take(max_heaps) {
+        for (occupied, i) in candidates.into_iter().take(max_heaps) {
+            let Some(b) = self.blocks[i].as_ref() else { continue };
+            let its_free = b.free.total_free();
+            let after_free = free_staying.saturating_sub(its_free);
+            if to_move + occupied + (64 << 20) > after_free {
+                break;
+            }
+            free_staying = after_free;
+            to_move += occupied;
             if let Some(b) = self.blocks[i].as_mut() {
                 b.draining = true;
                 marked += 1;
@@ -505,6 +571,11 @@ pub(crate) fn texture_room() -> u64 {
     (lock(&TEXTURES).blocks() as u64 * TEXTURE_BLOCK).saturating_sub(HELD.load(Ordering::Relaxed))
 }
 
+/// The bytes of the card's memory the blocks of textures take now.
+pub(crate) fn texture_block_bytes() -> u64 {
+    lock(&TEXTURES).blocks() as u64 * TEXTURE_BLOCK
+}
+
 /// For the memory line: blocks of textures and of staging buffers, in MiB.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 2] {
@@ -555,6 +626,55 @@ struct Reclaim {
     methods: &'static [*const (); 3],
     references: AtomicU32,
     piece: Piece,
+    /// The texture's address ([`BLOCK_OF`]).
+    raw: usize,
+}
+
+/// The block each pooled texture alive lies in, by the texture's address:
+/// for [`evacuating`].
+static BLOCK_OF: std::sync::LazyLock<Mutex<std::collections::HashMap<usize, usize>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Whether `texture` lies in a block being emptied (`draining`): its host
+/// copy is better made again elsewhere (`resource::relocate_sparse`), so
+/// that the block's last textures go and it is let go.
+pub(crate) fn evacuating(texture: &ID3D12Resource) -> bool {
+    let Some(block) = BLOCK_OF.lock().unwrap_or_else(|e| e.into_inner()).get(&(texture.as_raw() as usize)).copied() else {
+        return false;
+    };
+    lock(&TEXTURES).blocks.get(block).and_then(Option::as_ref).is_some_and(|b| b.draining)
+}
+
+/// For the VRAM census (`resource::vram_census`): blocks of textures by how
+/// full they are, in tenths (0: empty, 10: full), the draining ones, and the
+/// bytes of pieces resting before they may be used again.
+pub(crate) fn census() -> ([u32; 11], u32, u64) {
+    let pool = lock(&TEXTURES);
+    let mut tenths = [0u32; 11];
+    let mut draining = 0;
+    for b in pool.blocks.iter().flatten() {
+        let free: u64 = b.free.0.values().sum();
+        let full = TEXTURE_BLOCK.saturating_sub(free) * 10 / TEXTURE_BLOCK;
+        tenths[full.min(10) as usize] += 1;
+        draining += u32::from(b.draining);
+    }
+    let resting = pool.resting.iter().map(|(_, p)| p.len).sum();
+    (tenths, draining, resting)
+}
+
+/// Free bytes in blocks that are not being emptied, as the largest free
+/// range of any such block and their sum: what textures made again can be
+/// cut from without a new block.
+pub(crate) fn room_outside_draining() -> (u64, u64) {
+    let pool = lock(&TEXTURES);
+    let (mut largest, mut sum) = (0u64, 0u64);
+    for b in pool.blocks.iter().flatten().filter(|b| !b.draining) {
+        for &len in b.free.0.values() {
+            largest = largest.max(len);
+            sum += len;
+        }
+    }
+    (largest, sum)
 }
 
 struct Methods([*const (); 3]);
@@ -591,6 +711,12 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
         let left = (*this.cast::<Reclaim>()).references.fetch_sub(1, Ordering::AcqRel) - 1;
         if left == 0 {
             let gone = Box::from_raw(this.cast::<Reclaim>());
+            {
+                let mut of = BLOCK_OF.lock().unwrap_or_else(|e| e.into_inner());
+                if of.get(&gone.raw) == Some(&gone.piece.block) {
+                    of.remove(&gone.raw);
+                }
+            }
             HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
             lock(&TEXTURES).give(gone.piece, now());
         }
@@ -757,7 +883,9 @@ pub(crate) fn begun_before(texture: &ID3D12Resource) -> Option<u64> {
 /// Makes `texture` give `piece` back when the last reference to it goes.
 fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
     const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
-    let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece }));
+    let raw = texture.as_raw() as usize;
+    BLOCK_OF.lock().unwrap_or_else(|e| e.into_inner()).insert(raw, piece.block);
+    let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece, raw }));
     // SAFETY: a COM object of ours with one reference, which this takes and
     // drops at the end; the texture takes its own.
     unsafe {

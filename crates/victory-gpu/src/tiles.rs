@@ -71,6 +71,15 @@ const HEAP_TILES: u32 = 1024;
 /// no heap could be had); uploads recorded again for such a level.
 pub(crate) static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
+/// The most tiles a level may have to be given without room
+/// ([`Tiled::small_when_full`]): 4, 256 KiB (a 512x512 level of BC1, or
+/// 256x256 of BC7).
+const SMALL_LEVEL_TILES: u32 = 4;
+
+/// Bytes of tiles given without room since the start
+/// ([`Tiled::small_when_full`]).
+static SMALL_GIVEN: AtomicU64 = AtomicU64::new(0);
+
 /// Whether textures are made this way: the switch
 /// (`VICTORY_LEVELS_ON_DEMAND=1`; off by default), and a card that reads
 /// zeros from, and drops writes to, levels without memory (tiled resources
@@ -423,9 +432,55 @@ impl Tiled {
         let named = held | card;
         // The levels the card itself writes are few and are not kept
         // waiting: a write of the card's into no memory is lost.
-        let changed = self.give_locked(&mut given, queue, device, texture, named, if room { named } else { card });
+        let may = if room { named } else { card | self.small_when_full(&given, named) };
+        let changed = self.give_locked(&mut given, queue, device, texture, named, may);
         let missing = self.without_locked(&given, named) != 0;
         (changed, missing)
+    }
+
+    /// Without room, the held levels of `named` small enough to cost the
+    /// card little (each [`SMALL_LEVEL_TILES`] tiles at most, and the packed
+    /// tail) that have no tiles yet, while what was given this way stays
+    /// under `VICTORY_TILES_WHEN_FULL_MB` (384; 0: none, as before).
+    ///
+    /// Without them such a texture reads zeros: black. Run texlogs/census
+    /// (RTX 4060 Ti 8 GB, the card past its budget from the first world
+    /// minute): 3,714 textures with levels on demand alive, 9 MB given to
+    /// 137 levels, 933 uploads that left a held level without memory; the
+    /// grey skin and black faces of the cell were such textures. With their
+    /// small levels the same textures show, blurred, at a few MB.
+    fn small_when_full(&self, given: &Given, named: u32) -> u32 {
+        static MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let most = *MB.get_or_init(|| {
+            std::env::var("VICTORY_TILES_WHEN_FULL_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(384)
+        }) << 20;
+        if most == 0 || SMALL_GIVEN.load(Ordering::Relaxed) >= most {
+            return 0;
+        }
+        let first_packed = self.standard.len() as u32;
+        let mut may = 0u32;
+        let mut tiles = 0u64;
+        for level in 0..first_packed.min(32) {
+            let count = self.standard[level as usize];
+            if named & (1 << level) != 0 && !given.levels[level as usize] && count <= SMALL_LEVEL_TILES {
+                may |= 1 << level;
+                tiles += u64::from(count);
+            }
+        }
+        if self.packed > 0 && !given.packed {
+            for level in first_packed..self.levels.min(32) {
+                if named & (1 << level) != 0 {
+                    may |= 1 << level;
+                }
+            }
+            if may >> first_packed.min(31) != 0 {
+                tiles += u64::from(self.packed);
+            }
+        }
+        if may != 0 {
+            SMALL_GIVEN.fetch_add(tiles * TILE, Ordering::Relaxed);
+        }
+        may
     }
 
     /// At the submission of a list in which the card itself writes the
