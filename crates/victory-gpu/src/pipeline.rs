@@ -771,6 +771,30 @@ pub(crate) fn hand_out_slot(
     object::hand_out(PIPELINE, pipeline, iid, &PIPELINE_IIDS, out)
 }
 
+/// Precompiled paths must not claim success until the host driver has built a
+/// usable pipeline.  This is intentionally separate from normal lazy PSO
+/// creation, whose worker queue is essential for ordinary title pipelines.
+#[cfg(windows)]
+pub(crate) fn hand_out_slot_verified(
+    shaders: Vec<Arc<Shader>>,
+    graphics: Option<Box<host::GraphicsState>>,
+    precompiled_slot: u16,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    let host = Arc::new(make::Pending::new_with_slot(shaders.clone(), graphics, precompiled_slot));
+    if !make::now(&host) {
+        return crate::object::E_NOTIMPL;
+    }
+    known::note(host.key(), &shaders, host.graphics.as_deref());
+    let pipeline = Box::new(Pipeline {
+        object: Object::new(&FUNCTIONS), packet: [0; 8], host, builder: false,
+        precompiled_slot, shaders, bound: std::sync::atomic::AtomicBool::new(false),
+        executed: std::sync::atomic::AtomicBool::new(false),
+    });
+    object::hand_out(PIPELINE, pipeline, iid, &PIPELINE_IIDS, out)
+}
+
 /// Device method.
 pub(crate) extern "system" fn create_graphics(
     _: This,

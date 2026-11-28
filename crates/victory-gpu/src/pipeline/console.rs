@@ -3,7 +3,7 @@
 //! E_NOTIMPL and therefore use the title's ordinary fallback.
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
-use super::{Shader, hand_out};
+use super::Shader;
 use crate::object::{HRESULT, Iid, This};
 use victory_shader::{Container, FourCC, HwStage};
 
@@ -53,7 +53,8 @@ fn compute(desc: *const u8, iid: *const Iid, out: *mut This) -> Result<HRESULT, 
     let p = victory_shader::native_programs(part.data).map_err(|_|"program parse failed")?.into_iter().find(|p|p.stage==HwStage::Cs).ok_or("container has no compute program")?;
     let _ = p;
     if shader.translated().is_none() { return Err("compute container does not translate"); }
-    Ok(hand_out(vec![shader], None, iid, out))
+    let hr = super::hand_out_slot_verified(vec![shader], None, 0x218, iid, out);
+    if hr == crate::object::E_NOTIMPL { Err("host compute PSO creation failed") } else { Ok(hr) }
 }
 
 pub(crate) fn try_compute(desc: *const u8, iid: *const Iid, out: *mut This) -> Option<Result<HRESULT, Refusal>> {
