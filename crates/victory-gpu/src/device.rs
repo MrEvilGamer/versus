@@ -428,7 +428,15 @@ extern "system" fn dispatch_218(
     out: *mut This,
 ) -> HRESULT {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *ENABLED.get_or_init(|| std::env::var_os("VICTORY_ENABLE_218").is_some()) {
+    // Treat the switch as an explicit opt-in.  Merely exporting
+    // `VICTORY_ENABLE_218=0` must not activate the experimental path; this
+    // matters for launchers that preserve environment variables between A/B
+    // runs and keeps the ordinary 0x1f0 fallback deterministic.
+    if *ENABLED.get_or_init(|| {
+        std::env::var("VICTORY_ENABLE_218")
+            .ok()
+            .is_some_and(|v| v.trim() == "1")
+    }) {
         pipeline::create_precompiled_compute(this, desc, iid, out)
     } else {
         unknown_pipeline::<0x218>(this, desc.cast(), iid, out)
