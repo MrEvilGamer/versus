@@ -54,6 +54,35 @@ pub(crate) struct ComputeHead {
     stage: Bytecode,
 }
 
+/// Native Xbox slot-0x1c8 graphics descriptor. The stage block index is not
+/// itself a shader-stage identity; its records blob carries the source
+/// container hash used by the native graphics library.
+#[repr(C)]
+pub(crate) struct NativeGraphicsDesc {
+    pub(crate) root: This,
+    pub(crate) state_a: Bytecode,
+    pub(crate) state_b: Bytecode,
+    pub(crate) stages: [NativeGraphicsStage; 7],
+}
+
+#[repr(C)]
+pub(crate) struct NativeGraphicsStage {
+    pub(crate) code: Bytecode,
+    pub(crate) records: Bytecode,
+}
+
+/// Read a native graphics stage's records blob and extract its source hash.
+/// The caller owns the descriptor for the duration of the call.
+pub(crate) fn native_stage_hash(stage: &NativeGraphicsStage) -> Option<[u8; 16]> {
+    if stage.records.code.is_null() || stage.records.size == 0 || stage.records.size > 16 << 20 {
+        return None;
+    }
+    // SAFETY: the Xbox ABI keeps the records blob alive for this call and the
+    // size is bounded above before constructing the slice.
+    let records = unsafe { std::slice::from_raw_parts(stage.records.code, stage.records.size) };
+    host::native_graphics_stage_hash(records)
+}
+
 /// A shader container a title passed, shared by every pipeline with the
 /// same bytes.
 pub(crate) struct Shader {

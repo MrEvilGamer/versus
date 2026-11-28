@@ -389,6 +389,18 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
             .as_ref()
             .and_then(|w| words(w[0] as usize));
         if SLOT == 0x1c8 && calls <= 2 {
+            // Resolve the native stage identities from the live slot-57
+            // descriptor.  The records hash, not the block position, is the
+            // key used by the graphics library.
+            if let Some(native) = unsafe { (desc as *const pipeline::NativeGraphicsDesc).as_ref() } {
+                let hashes: Vec<String> = native
+                    .stages
+                    .iter()
+                    .filter_map(pipeline::native_stage_hash)
+                    .map(|h| h.iter().map(|b| format!("{b:02x}")).collect())
+                    .collect();
+                tracing::info!(stage_hashes = ?hashes, "native 0x1c8 stage identities");
+            }
             if let (Some(w), Some(dir)) = (description.as_ref(), std::env::var_os("VICTORY_DUMP_1C8")) {
                 let dir = std::path::PathBuf::from(dir);
                 let _ = std::fs::create_dir_all(&dir);
