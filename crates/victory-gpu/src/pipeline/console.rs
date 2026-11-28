@@ -34,7 +34,11 @@ pub(crate) fn file(shader: &Arc<Shader>) {
 /// precede the ordinary 0x1f0 shader creations, so encounter-only indexing
 /// guarantees a miss even when the matching container is available locally.
 pub(crate) fn preload() {
-    if !on() { return; }
+    // Keep the stable digest-by-encounter path as the default.  The offline
+    // corpus is opt-in while its containers are validated against the exact
+    // title build; this prevents a stale or incompatible corpus from making
+    // startup itself unsafe.
+    if !on() || std::env::var("VICTORY_PIPELINE_PRELOAD").ok().as_deref() != Some("1") { return; }
     PRELOADED.get_or_init(|| {
         let Some(root) = std::env::var_os("VICTORY_PIPELINE_CONTAINER_DIR") else { return; };
         let mut count = 0u64;
