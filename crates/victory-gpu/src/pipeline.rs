@@ -93,7 +93,8 @@ pub(crate) fn native_graphics_shaders(
 ) -> Option<(Vec<Arc<Shader>>, Box<host::GraphicsState>)> {
     let dir = std::env::var_os("VICTORY_FSPX_GFX_DIR")?;
     let root = std::path::PathBuf::from(dir);
-    let index = root.parent().unwrap_or(&root).join("digest-index.txt");
+    let index = [root.join("digest-index.txt"), root.parent().unwrap_or(&root).join("digest-index.txt")]
+        .into_iter().find(|p| p.is_file())?;
     let text = std::fs::read_to_string(index).ok()?;
     let mut entries = HashMap::<String, (String, String)>::new();
     for line in text.lines() {
