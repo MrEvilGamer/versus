@@ -1594,6 +1594,17 @@ pub(crate) extern "system" fn create_placed_uav(
     desc: *const [u32; 16],
     handle: u64,
 ) {
+    if let Some(raw) = words(desc) {
+        let address = u64::from(raw[10]) | u64::from(raw[11]) << 32;
+        if address == 0 {
+            static ZERO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = ZERO.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n <= 16 || n.is_power_of_two() {
+                tracing::warn!(count=n, handle=format_args!("{handle:#x}"), resource_ptr=format_args!("{resource:p}"),
+                    raw_tail=?raw[10..], "placed UAV created with zero title address");
+            }
+        }
+    }
     if let (Some(resource), Some(desc)) = (placed_resource_words(resource), placed_view_words(desc, true)) {
         record(handle, View::Placed(true, resource, desc));
     }
