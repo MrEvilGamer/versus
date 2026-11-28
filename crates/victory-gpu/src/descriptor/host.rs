@@ -4705,6 +4705,7 @@ fn make_twinned(
                 if (said.len() < 64 && said.insert(at)) || times.is_power_of_two() {
                     tracing::warn!(
                         address = format_args!("{at:#x}"),
+                        tail = ?desc[12..],
                         times,
                         "placed unordered texture view not mirrored (null: writes through it are lost): resource {resource:?}, view {:?}",
                         &desc[..10]
