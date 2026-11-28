@@ -11,6 +11,7 @@ type Refusal = &'static str;
 const ADDR: std::ops::Range<u64> = 0x1_0000..0x8000_0000_0000;
 static BY_DIGEST: Mutex<Option<HashMap<[u8;16], Arc<Shader>>>> = Mutex::new(None);
 static REFUSED: OnceLock<bool> = OnceLock::new();
+static PRELOADED: OnceLock<()> = OnceLock::new();
 
 pub(crate) fn on() -> bool {
     *REFUSED.get_or_init(|| std::env::var("VICTORY_PIPELINES_X").ok().is_some_and(|v| v.trim()=="1"))
@@ -26,6 +27,33 @@ pub(crate) fn file(shader: &Arc<Shader>) {
     if let Some(d) = shader.digest {
         BY_DIGEST.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).entry(d).or_insert_with(|| shader.clone());
     }
+}
+
+/// Index legally supplied, offline-carved shader containers before the title
+/// starts asking for deserialized pipelines.  Runtime 0x218 calls commonly
+/// precede the ordinary 0x1f0 shader creations, so encounter-only indexing
+/// guarantees a miss even when the matching container is available locally.
+pub(crate) fn preload() {
+    if !on() { return; }
+    PRELOADED.get_or_init(|| {
+        let Some(root) = std::env::var_os("VICTORY_PIPELINE_CONTAINER_DIR") else { return; };
+        let mut count = 0u64;
+        let Ok(entries) = std::fs::read_dir(root) else { return; };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("dxbc") { continue; }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue; };
+            let stage = if name.contains("_CS_") { "compute" }
+                else if name.contains("_VS_") { "vertex" }
+                else if name.contains("_PS_") { "pixel" }
+                else { continue };
+            let Ok(bytes) = std::fs::read(&path) else { continue; };
+            let shader = super::shader(stage, &bytes);
+            file(&shader);
+            count += 1;
+        }
+        tracing::info!(count, "preloaded offline shader containers for console pipeline identity");
+    });
 }
 
 fn read(addr: u64, size: u64) -> Result<Vec<u8>, Refusal> {
@@ -58,6 +86,7 @@ fn compute(desc: *const u8, iid: *const Iid, out: *mut This) -> Result<HRESULT, 
 }
 
 pub(crate) fn try_compute(desc: *const u8, iid: *const Iid, out: *mut This) -> Option<Result<HRESULT, Refusal>> {
+    preload();
     Some(compute(desc, iid, out))
 }
 
