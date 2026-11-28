@@ -4664,12 +4664,39 @@ fn make_twinned(
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
+                // A placed texture UAV has no `ID3D12Resource` pointer in the
+                // descriptor.  Resolve the title's placement to the same
+                // host mirror used by SRVs, then create a real UAV against
+                // that mirror.  Returning None here silently discarded every
+                // compute write to placed textures (water, counters and many
+                // lighting targets), and made subsequent passes consume
+                // stale/black data.
+                if *unordered {
+                    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                    if let Some(title_texture) = crate::resource::texture_at(address, resource) {
+                        crate::resource::want_level(title_texture, crate::resource::first_mip(desc));
+                        if let Some(texture) = crate::resource::host_resource(title_texture) {
+                            let mut view = uav_desc(desc[..10].try_into().ok()?);
+                            if !fits(texture, Some(&mut view.Format), true) {
+                                return None;
+                            }
+                            // SAFETY: `texture` is the live host mirror held
+                            // by the title resource for this descriptor use.
+                            unsafe {
+                                device.CreateUnorderedAccessView(
+                                    texture,
+                                    None::<&ID3D12Resource>,
+                                    Some(&view),
+                                    at,
+                                )
+                            };
+                            return Some(Some(texture.clone()));
+                        }
+                    }
+                }
                 // shortcut: unordered access to a texture the title placed
-                // itself is not mirrored; give it a resource as shader
-                // views of such textures get when a dispatch writes one.
-                // Each texture is said once (the first 64), with how many times
-                // such a view was asked for so far: what shaders write through
-                // them is lost.
+                // itself could not be resolved; keep the diagnostic, but do
+                // not claim success or bind an unrelated resource.
                 static SAID: Mutex<std::collections::BTreeSet<u64>> = Mutex::new(std::collections::BTreeSet::new());
                 static TIMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let times = TIMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
