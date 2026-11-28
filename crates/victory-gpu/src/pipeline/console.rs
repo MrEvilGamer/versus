@@ -60,3 +60,26 @@ fn compute(desc: *const u8, iid: *const Iid, out: *mut This) -> Result<HRESULT, 
 pub(crate) fn try_compute(desc: *const u8, iid: *const Iid, out: *mut This) -> Option<Result<HRESULT, Refusal>> {
     Some(compute(desc, iid, out))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::digest;
+    fn rec(tag: u32, d: [u8; 16]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&2u32.to_le_bytes());
+        b.extend_from_slice(&24u32.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&0x40u32.to_le_bytes());
+        b.extend_from_slice(&tag.to_le_bytes());
+        b.extend_from_slice(&d);
+        b
+    }
+    #[test]
+    fn records_digest_is_terminal_and_bounded() {
+        let d = [0xabu8; 16];
+        assert_eq!(digest(&rec(0x43, d)), Ok(d));
+        assert!(digest(&rec(0x44, d)).is_err());
+        assert!(digest(&[0u8; 8]).is_err());
+    }
+}
