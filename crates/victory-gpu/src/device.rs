@@ -400,6 +400,19 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
                     .map(|h| h.iter().map(|b| format!("{b:02x}")).collect())
                     .collect();
                 tracing::info!(stage_hashes = ?hashes, "native 0x1c8 stage identities");
+                // The resolver is opt-in and only returns a pipeline when all
+                // required native stages and the fixed state decode cleanly.
+                // Otherwise retain E_NOTIMPL so the title's ordinary 0x2b0
+                // fallback remains authoritative.
+                if std::env::var_os("VICTORY_FSPX_GFX_DIR").is_some() {
+                    if let Some((shaders, graphics)) = pipeline::native_graphics_shaders(native) {
+                        if shaders.iter().all(|s| s.translated().is_some()) {
+                            tracing::info!(count = shaders.len(), "native 0x1c8 host stages resolved");
+                            return pipeline::hand_out_slot(shaders, Some(graphics), 0x1c8, _iid, out);
+                        }
+                        tracing::warn!("native 0x1c8 stages resolved but one or more shaders do not translate");
+                    }
+                }
             }
             if let (Some(w), Some(dir)) = (description.as_ref(), std::env::var_os("VICTORY_DUMP_1C8")) {
                 let dir = std::path::PathBuf::from(dir);

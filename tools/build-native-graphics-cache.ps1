@@ -28,6 +28,7 @@ $records = @(
         $meta = Get-Content (Join-Path $_.DirectoryName ($stem + ".json")) -Raw | ConvertFrom-Json
         [pscustomobject]@{
             sha256 = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            digest = [string]$meta.digest[0]
             stage = $meta.stage
             code = $_.Name
             container = ($stem + ".dxbc")
@@ -35,6 +36,8 @@ $records = @(
     }
 )
 $records | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $library "code-index.json") -Encoding utf8
+$records | ForEach-Object { "$($_.digest.ToLowerInvariant())|$($_.stage)|$($_.container)" } |
+    Set-Content -LiteralPath (Join-Path $library "digest-index.txt") -Encoding ascii
 
 Write-Output "Native graphics cache: $library"
 Write-Output "Use VICTORY_FSPX_GFX_DIR=$library\fspx for the opt-in runtime resolver once enabled."

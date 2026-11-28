@@ -83,6 +83,49 @@ pub(crate) fn native_stage_hash(stage: &NativeGraphicsStage) -> Option<[u8; 16]>
     host::native_graphics_stage_hash(records)
 }
 
+/// Resolve opt-in native graphics stage records against the external FSPX
+/// cache produced by `build-native-graphics-cache.ps1`.  This is deliberately
+/// fallible: an incomplete cache must take the normal 0x2b0 fallback rather
+/// than fabricate a host PSO.
+#[cfg(windows)]
+pub(crate) fn native_graphics_shaders(
+    desc: &NativeGraphicsDesc,
+) -> Option<(Vec<Arc<Shader>>, Box<host::GraphicsState>)> {
+    let dir = std::env::var_os("VICTORY_FSPX_GFX_DIR")?;
+    let root = std::path::PathBuf::from(dir);
+    let index = root.parent().unwrap_or(&root).join("digest-index.txt");
+    let text = std::fs::read_to_string(index).ok()?;
+    let mut entries = HashMap::<String, (String, String)>::new();
+    for line in text.lines() {
+        let mut p = line.split('|');
+        let (Some(d), Some(stage), Some(container)) = (p.next(), p.next(), p.next()) else { continue };
+        if d.len() == 32 && d.bytes().all(|b| b.is_ascii_hexdigit()) {
+            entries.insert(d.to_ascii_lowercase(), (stage.to_owned(), container.to_owned()));
+        }
+    }
+    let mut shaders = Vec::new();
+    for stage in &desc.stages {
+        let Some(hash) = native_stage_hash(stage) else { continue };
+        let key = hash.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let (kind, file) = entries.get(&key)?;
+        let bytes = std::fs::read(root.join(file)).ok()?;
+        let stage_name: &'static str = match kind.as_str() {
+            "vs" => "vertex", "ps" => "pixel", "ms" => "mesh", "as" => "amplification",
+            _ => continue,
+        };
+        shaders.push(shader(stage_name, &bytes));
+    }
+    if shaders.is_empty() { return None; }
+    let state_b = if desc.state_b.code.is_null() || desc.state_b.size == 0 || desc.state_b.size > 1 << 20 {
+        return None;
+    } else {
+        let mut bytes = vec![0u8; desc.state_b.size];
+        if !crate::host::read_into(desc.state_b.code, &mut bytes) { return None; }
+        bytes
+    };
+    Some((shaders, Box::new(host::native_graphics_state(&state_b)?)))
+}
+
 /// A shader container a title passed, shared by every pipeline with the
 /// same bytes.
 pub(crate) struct Shader {
@@ -677,7 +720,7 @@ fn hand_out(
     )
 }
 
-fn hand_out_slot(
+pub(crate) fn hand_out_slot(
     shaders: Vec<Arc<Shader>>,
     #[cfg(windows)] graphics: Option<Box<host::GraphicsState>>,
     precompiled_slot: u16,
