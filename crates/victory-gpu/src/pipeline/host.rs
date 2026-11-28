@@ -177,6 +177,51 @@ pub(crate) fn native_graphics_state(state_b: &[u8]) -> Option<GraphicsState> {
     Some(g)
 }
 
+/// Decode the verified colour portion of native state-A.  ScarlettPort's
+/// corpus identifies the vertex layout at 380..420 bytes and mesh layout at
+/// 464..520 bytes; all other shapes are refused rather than guessed.  The
+/// remaining raster/depth registers are intentionally left at D3D12 defaults
+/// until their independently validated mappings are available.
+pub(crate) fn native_graphics_blend(state_a: &[u8], targets: &D3D12_RT_FORMAT_ARRAY) -> Option<D3D12_BLEND_DESC> {
+    let shift = if (380..=420).contains(&state_a.len()) && (state_a.len() - 380) % 8 == 0 { 0 }
+        else if (464..=520).contains(&state_a.len()) && (state_a.len() - 464) % 8 == 0 { 84 }
+        else { return None };
+    let u32_at = |at: usize| -> Option<u32> { Some(u32::from_le_bytes(state_a.get(at..at+4)?.try_into().ok()?)) };
+    if u32_at(0)? & !0x18 != 0x4005_d800 { return None; }
+    let mask = u32_at(0x78 + shift)?;
+    let factor = |v: u32, alpha: bool| -> Option<D3D12_BLEND> { Some(match (v, alpha) {
+        (0,false)=>D3D12_BLEND_ZERO,(1,false)=>D3D12_BLEND_ONE,(2,false)=>D3D12_BLEND_SRC_COLOR,
+        (3,false)=>D3D12_BLEND_INV_SRC_COLOR,(4,false)=>D3D12_BLEND_SRC_ALPHA,(5,false)=>D3D12_BLEND_INV_SRC_ALPHA,
+        (6,false)=>D3D12_BLEND_DEST_ALPHA,(7,false)=>D3D12_BLEND_INV_DEST_ALPHA,(8,false)=>D3D12_BLEND_DEST_COLOR,
+        (9,false)=>D3D12_BLEND_INV_DEST_COLOR,(10,false)=>D3D12_BLEND_SRC_ALPHA_SAT,
+        (13,_)=>D3D12_BLEND_BLEND_FACTOR,(14,_)=>D3D12_BLEND_INV_BLEND_FACTOR,
+        (2,true)=>D3D12_BLEND_SRC_ALPHA,(3,true)=>D3D12_BLEND_INV_SRC_ALPHA,
+        (8,true)=>D3D12_BLEND_DEST_ALPHA,(9,true)=>D3D12_BLEND_INV_DEST_ALPHA,
+        (15,false)=>D3D12_BLEND_SRC1_COLOR,(16,false)=>D3D12_BLEND_INV_SRC1_COLOR,
+        (15,true)=>D3D12_BLEND_SRC1_ALPHA,(16,true)=>D3D12_BLEND_INV_SRC1_ALPHA,
+        (17,_)=>D3D12_BLEND_SRC1_ALPHA,(18,_)=>D3D12_BLEND_INV_SRC1_ALPHA,
+        (19,_)=>D3D12_BLEND_ALPHA_FACTOR,(20,_)=>D3D12_BLEND_INV_ALPHA_FACTOR,
+        _=>return None,
+    })};
+    let op = |v: u32| -> Option<D3D12_BLEND_OP> { Some(match v { 0=>D3D12_BLEND_OP_ADD,1=>D3D12_BLEND_OP_SUBTRACT,2=>D3D12_BLEND_OP_MIN,3=>D3D12_BLEND_OP_MAX,4=>D3D12_BLEND_OP_REV_SUBTRACT,_=>return None }) };
+    let mut out = GraphicsState::default().blend;
+    out.IndependentBlendEnable = true.into();
+    for i in 0..(targets.NumRenderTargets as usize).min(8) {
+        let c = u32_at(0xd0 + shift + i*4)?;
+        let separate = c >> 29 & 1 != 0;
+        let cs = c & 31; let cf = c >> 5 & 7; let cd = c >> 8 & 31;
+        let as_ = if separate { c >> 16 & 31 } else { cs };
+        let af = if separate { c >> 21 & 7 } else { cf };
+        let ad = if separate { c >> 24 & 31 } else { cd };
+        let b = &mut out.RenderTarget[i];
+        b.BlendEnable = (c >> 30 & 1 != 0).into();
+        b.SrcBlend = factor(cs,false)?; b.DestBlend = factor(cd,false)?; b.BlendOp = op(cf)?;
+        b.SrcBlendAlpha = factor(as_,true)?; b.DestBlendAlpha = factor(ad,true)?; b.BlendOpAlpha = op(af)?;
+        b.RenderTargetWriteMask = ((mask >> (4*i)) & 0xf) as u8;
+    }
+    Some(out)
+}
+
 /// Extract the 16-byte source-container identity carried by a native
 /// graphics stage's records blob.  Native slot 0x1c8 uses the same terminal
 /// `0x43` record convention as the game's shader containers; the stage block

@@ -124,7 +124,16 @@ pub(crate) fn native_graphics_shaders(
         if !crate::host::read_into(desc.state_b.code, &mut bytes) { return None; }
         bytes
     };
-    Some((shaders, Box::new(host::native_graphics_state(&state_b)?)))
+    let mut graphics = host::native_graphics_state(&state_b)?;
+    if !desc.state_a.code.is_null() && desc.state_a.size > 0 && desc.state_a.size <= 1 << 20 {
+        let mut state_a = vec![0u8; desc.state_a.size];
+        if crate::host::read_into(desc.state_a.code, &mut state_a) {
+            if let Some(blend) = host::native_graphics_blend(&state_a, &graphics.targets) {
+                graphics.blend = blend;
+            }
+        }
+    }
+    Some((shaders, Box::new(graphics)))
 }
 
 /// A shader container a title passed, shared by every pipeline with the
