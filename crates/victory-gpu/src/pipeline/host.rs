@@ -183,10 +183,12 @@ pub(crate) fn native_graphics_state(state_b: &[u8]) -> Option<GraphicsState> {
 /// position is not a reliable vertex/pixel/mesh discriminator.
 pub(crate) fn native_graphics_stage_hash(records: &[u8]) -> Option<[u8; 16]> {
     records
-        .windows(17)
+        .windows(20)
         .rev()
-        .find(|bytes| bytes[0] == 0x43)
-        .map(|bytes| bytes[1..].try_into().expect("17-byte window"))
+        .find(|bytes| {
+            u32::from_le_bytes(bytes[..4].try_into().expect("20-byte window")) == 0x43
+        })
+        .map(|bytes| bytes[4..20].try_into().expect("16-byte identity"))
 }
 
 /// Integer render target formats: D3D12 cannot blend into them.
@@ -1712,9 +1714,9 @@ mod tests {
     #[test]
     fn native_stage_records_extract_terminal_identity() {
         let mut records = vec![0u8; 32];
-        records.extend_from_slice(&[0x43]);
+        records.extend_from_slice(&0x43u32.to_le_bytes());
         records.extend_from_slice(&[0xabu8; 16]);
         assert_eq!(native_graphics_stage_hash(&records), Some([0xab; 16]));
-        assert_eq!(native_graphics_stage_hash(&[0x43, 1, 2]), None);
+        assert_eq!(native_graphics_stage_hash(&[0x43, 0, 0, 0, 1, 2]), None);
     }
 }
